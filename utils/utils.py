@@ -1,4 +1,6 @@
 import torch
+from pathlib import Path
+import matplotlib.pyplot as plt
 
 def load_model_and_tokenizer(model, attn_implementation="eager", device_map="auto", dtype="float16", trust_remote_code=True):
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -67,58 +69,113 @@ def _token_labels(tokenizer, sequence_ids, indices, max_chars=10):
     for idx in indices:
         text = tokenizer.decode([int(sequence_ids[idx])], skip_special_tokens=False)
         text = text.replace("\n", "\\n").replace("\t", "\\t").replace(" ", "_")
+        text = text.replace("$", r"\$")
         if len(text) > max_chars:
             text = text[:max_chars] + "..."
         labels.append(f"{idx}:{text}")
     return labels
 
-def plot_all_layer_head_attention(
+def _token_ticks_and_labels(tokenizer, sequence_ids, indices, max_chars=10):
+    tick_positions = []
+    tick_labels = []
+
+    if indices[0] > 0:
+        tick_positions.append(-1)
+        tick_labels.append("...")
+
+    tick_positions.extend(range(len(indices)))
+    tick_labels.extend(_token_labels(tokenizer, sequence_ids, indices, max_chars))
+
+    if indices[-1] < len(sequence_ids) - 1:
+        tick_positions.append(len(indices))
+        tick_labels.append("...")
+
+    return tick_positions, tick_labels
+
+def _set_token_axis_labels(ax, tokenizer, sequence_ids, x_indices, y_indices, label_fontsize):
+    x_ticks, x_labels = _token_ticks_and_labels(tokenizer, sequence_ids, x_indices)
+    y_ticks, y_labels = _token_ticks_and_labels(tokenizer, sequence_ids, y_indices)
+
+    ax.set_xticks(x_ticks)
+    ax.set_yticks(y_ticks)
+    ax.set_xticklabels(x_labels, rotation=90, fontsize=label_fontsize)
+    ax.set_yticklabels(y_labels, fontsize=label_fontsize)
+    ax.tick_params(length=0, pad=1)
+
+    ax.set_xlim(min(x_ticks) - 0.5, max(x_ticks) + 0.5)
+    ax.set_ylim(max(y_ticks) + 0.5, min(y_ticks) - 0.5)
+
+def _normalize_indices(indices, total, name):
+    if indices is None:
+        return list(range(total))
+
+    normalized = []
+    for idx in indices:
+        idx = total + idx if idx < 0 else idx
+        if idx < 0 or idx >= total:
+            raise ValueError(f"{name} index {idx} is out of range 0..{total - 1}")
+        normalized.append(idx)
+    if not normalized:
+        raise ValueError(f"{name} selection cannot be empty.")
+    return normalized
+
+def plot_selective_attention_map(
     attn_weights,
+    layers: tuple,
+    heads: tuple,
+    input_range: tuple=(None, None),
+    output_range: tuple=(None, None),
     prompt_len=None,
     tokenizer=None,
     sequence_ids=None,
     out_path=None,
     cmap="Blues",
-    dpi=160,
-    panel_size=3.2,
-    label_fontsize=3,
+    dpi=180,
+    figsize=(18, 14),
+    label_fontsize=6,
     quantile=0.995,
-    tight=False,
+    tight=True,
 ):
-    from pathlib import Path
-
-    import matplotlib.pyplot as plt
 
     num_layers = len(attn_weights)
     num_heads = attn_weights[0].shape[1]
     seq_len = attn_weights[0].shape[-1]
-    if prompt_len is None:
-        x_indices = list(range(seq_len))
-        y_indices = list(range(seq_len))
-    else:
-        x_indices = list(range(prompt_len))
-        y_indices = list(range(prompt_len, seq_len))
+    selected_layers = _normalize_indices(layers, num_layers, "Layer")
+    selected_heads = _normalize_indices(heads, num_heads, "Head")
+
+    start_x, end_x = input_range
+    start_y, end_y = output_range
+
+    if start_x is None:
+        start_x = 0
+    if end_x is None:
+        end_x = seq_len if prompt_len is None else prompt_len
+    if start_y is None:
+        start_y = 0 if prompt_len is None else prompt_len
+    if end_y is None:
+        end_y = seq_len
+
+    x_indices = list(range(start_x, end_x))
+    y_indices = list(range(start_y, end_y))
 
     show_token_labels = tokenizer is not None and sequence_ids is not None
     if show_token_labels:
         sequence_ids = sequence_ids.detach().cpu()
-        x_labels = _token_labels(tokenizer, sequence_ids, x_indices)
-        y_labels = _token_labels(tokenizer, sequence_ids, y_indices)
+        if sequence_ids.dim() > 1:
+            sequence_ids = sequence_ids[0]
 
     fig, axes = plt.subplots(
-        num_layers,
-        num_heads,
-        figsize=(num_heads * panel_size, num_layers * panel_size),
+        len(selected_layers),
+        len(selected_heads),
+        figsize=figsize,
         squeeze=False,
     )
 
-    for layer_idx, layer_attn in enumerate(attn_weights):
-        print(f"Plotting layer {layer_idx + 1}/{num_layers}...")
-        for head_idx in range(num_heads):
-            ax = axes[layer_idx, head_idx]
-            attn_map = layer_attn[0, head_idx]
-            if prompt_len is not None:
-                attn_map = attn_map[prompt_len:, :prompt_len]
+    for row, layer_idx in enumerate(selected_layers):
+        layer_attn = attn_weights[layer_idx]
+        for col, head_idx in enumerate(selected_heads):
+            ax = axes[row, col]
+            attn_map = layer_attn[0, head_idx][y_indices][:, x_indices]
             vmax = float(torch.quantile(attn_map, quantile))
             if vmax <= 0:
                 vmax = float(attn_map.max()) or 1.0
@@ -126,22 +183,18 @@ def plot_all_layer_head_attention(
             ax.imshow(attn_map.numpy(), aspect="auto", interpolation="nearest", cmap=cmap, vmin=0, vmax=vmax)
 
             if show_token_labels:
-                ax.set_xticks(range(len(x_indices)))
-                ax.set_yticks(range(len(y_indices)))
-                ax.set_xticklabels(x_labels, rotation=90, fontsize=label_fontsize)
-                ax.set_yticklabels(y_labels, fontsize=label_fontsize)
-                ax.tick_params(length=0, pad=1)
+                _set_token_axis_labels(ax, tokenizer, sequence_ids, x_indices, y_indices, label_fontsize)
             else:
                 ax.set_xticks([])
                 ax.set_yticks([])
 
-            if layer_idx == 0:
-                ax.set_title(f"H{head_idx}", fontsize=8)
-            if head_idx == 0:
+            if row == 0:
+                ax.set_title(f"H{head_idx}", fontsize=9)
+            if col == 0:
                 ax.set_ylabel(f"L{layer_idx}", fontsize=8)
 
-    title = "Output-to-prompt attention maps" if prompt_len is not None else "Token-to-token attention maps"
-    fig.suptitle(f"{title} by layer and head", y=1.0)
+    title = "Selective output-to-prompt attention maps" if prompt_len is not None else "Selective token-to-token attention maps"
+    fig.suptitle(title, y=1.0)
     if tight:
         fig.tight_layout(pad=0.3)
     else:
@@ -157,8 +210,10 @@ def plot_all_layer_head_attention(
 
     return fig, axes
 
-def plot_aggregated_attention(
+def plot_single_attention_map(
     attn_weights,
+    input_range: tuple=(None, None),
+    output_range: tuple=(None, None),
     prompt_len=None,
     tokenizer=None,
     sequence_ids=None,
@@ -170,22 +225,28 @@ def plot_aggregated_attention(
     quantile=0.995,
     tight=True,
 ):
-    from pathlib import Path
-
-    import matplotlib.pyplot as plt
 
     # Average over all layers and all heads.
     attn = torch.stack([layer_attn[0] for layer_attn in attn_weights])
     attn_map = attn.mean(dim=(0, 1))
 
     seq_len = attn_map.shape[-1]
-    if prompt_len is None:
-        x_indices = list(range(seq_len))
-        y_indices = list(range(seq_len))
-    else:
-        x_indices = list(range(prompt_len))
-        y_indices = list(range(prompt_len, seq_len))
-        attn_map = attn_map[prompt_len:, :prompt_len]
+
+    start_x, end_x = input_range
+    start_y, end_y = output_range
+
+    if start_x is None:
+        start_x = 0
+    if end_x is None:
+        end_x = seq_len if prompt_len is None else prompt_len
+    if start_y is None:
+        start_y = 0 if prompt_len is None else prompt_len
+    if end_y is None:
+        end_y = seq_len
+
+    x_indices = list(range(start_x, end_x))
+    y_indices = list(range(start_y, end_y))
+    attn_map = attn_map[start_y:end_y, start_x:end_x]
 
     vmax = float(torch.quantile(attn_map, quantile))
     if vmax <= 0:
@@ -197,11 +258,9 @@ def plot_aggregated_attention(
 
     if tokenizer is not None and sequence_ids is not None:
         sequence_ids = sequence_ids.detach().cpu()
-        ax.set_xticks(range(len(x_indices)))
-        ax.set_yticks(range(len(y_indices)))
-        ax.set_xticklabels(_token_labels(tokenizer, sequence_ids, x_indices), rotation=90, fontsize=label_fontsize)
-        ax.set_yticklabels(_token_labels(tokenizer, sequence_ids, y_indices), fontsize=label_fontsize)
-        ax.tick_params(length=0, pad=1)
+        if sequence_ids.dim() > 1:
+            sequence_ids = sequence_ids[0]
+        _set_token_axis_labels(ax, tokenizer, sequence_ids, x_indices, y_indices, label_fontsize)
 
     if prompt_len is None:
         ax.set_xlabel("Key token")
