@@ -247,8 +247,12 @@ def plot_selective_attention_bar(
     dpi=180,
     figsize=(18, 14),
     label_fontsize=6,
+    orientation="vertical",
     tight=True,
 ):
+    if orientation not in ("vertical", "horizontal"):
+        raise ValueError("orientation must be 'vertical' or 'horizontal'.")
+
     num_layers = len(one_dimensional_attn_weights)
     num_heads = one_dimensional_attn_weights[0].shape[1]
     output_len = one_dimensional_attn_weights[0].shape[2]
@@ -293,15 +297,27 @@ def plot_selective_attention_bar(
             elif values.dim() > 1:
                 values = values.sum(dim=-1)
 
-            ax.bar(range(len(y_indices)), values.detach().cpu().numpy(), color=color)
+            positions = range(len(y_indices))
+            values = values.detach().cpu().numpy()
 
-            if show_token_labels:
-                ax.set_xticks(x_ticks)
-                ax.set_xticklabels(x_labels, rotation=90, fontsize=label_fontsize)
-                ax.tick_params(axis="x", length=0, pad=1)
-                ax.set_xlim(min(x_ticks) - 0.5, max(x_ticks) + 0.5)
+            if orientation == "vertical":
+                ax.bar(positions, values, color=color)
+                if show_token_labels:
+                    ax.set_xticks(x_ticks)
+                    ax.set_xticklabels(x_labels, rotation=90, fontsize=label_fontsize)
+                    ax.tick_params(axis="x", length=0, pad=1)
+                    ax.set_xlim(min(x_ticks) - 0.5, max(x_ticks) + 0.5)
+                else:
+                    ax.set_xticks([])
             else:
-                ax.set_xticks([])
+                ax.barh(positions, values, color=color)
+                if show_token_labels:
+                    ax.set_yticks(x_ticks)
+                    ax.set_yticklabels(x_labels, fontsize=label_fontsize)
+                    ax.tick_params(axis="y", length=0, pad=1)
+                    ax.set_ylim(max(x_ticks) + 0.5, min(x_ticks) - 0.5)
+                else:
+                    ax.set_yticks([])
 
             if row == 0:
                 ax.set_title(f"H{head_idx}", fontsize=9)
