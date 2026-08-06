@@ -29,6 +29,30 @@ def build_prompt(tokenizer, system_prompt=None, user_prompt=None, encode=True, a
 
     return tokenizer.apply_chat_template(messages, tokenize=encode, add_generation_prompt=add_generation_prompt, enable_thinking=enable_thinking)
 
+def find_leveraging_context(
+    tokenizer,
+    user_prompt,
+    leveraging_context,
+    system_prompt=None,
+):
+    rendered_prompt = build_prompt(
+        tokenizer,
+        system_prompt,
+        user_prompt,
+        encode=False,
+    )
+    start_char = rendered_prompt.index(leveraging_context)
+    end_char = start_char + len(leveraging_context)
+    encoded = tokenizer(rendered_prompt, return_offsets_mapping=True)
+    offsets = encoded["offset_mapping"]
+
+    start_token = next(i for i, (start, end) in enumerate(offsets) if end > start_char)
+    end_token = next(
+        (i for i, (start, end) in enumerate(offsets) if start >= end_char),
+        len(offsets),
+    )
+    return start_token, end_token
+
 def generate_and_concate(model, tokenizer, prompt: str, **kwargs):
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     prompt_length = inputs['input_ids'].shape[1] if 'input_ids' in inputs else inputs.input_ids.shape[1]
@@ -210,7 +234,97 @@ def plot_selective_attention_map(
 
     return fig, axes
 
-def plot_single_attention_map(
+def plot_selective_attention_bar(
+    one_dimensional_attn_weights,
+    layers: tuple,
+    heads: tuple,
+    output_range: tuple=(None, None),
+    prompt_len=None,
+    tokenizer=None,
+    sequence_ids=None,
+    out_path=None,
+    color="tab:blue",
+    dpi=180,
+    figsize=(18, 14),
+    label_fontsize=6,
+    tight=True,
+):
+    num_layers = len(one_dimensional_attn_weights)
+    num_heads = one_dimensional_attn_weights[0].shape[1]
+    output_len = one_dimensional_attn_weights[0].shape[2]
+    selected_layers = _normalize_indices(layers, num_layers, "Layer")
+    selected_heads = _normalize_indices(heads, num_heads, "Head")
+
+    start_y, end_y = output_range
+    if start_y is None:
+        start_y = 0
+    if end_y is None:
+        end_y = output_len
+    if start_y < 0 or end_y > output_len or start_y >= end_y:
+        raise ValueError(f"output_range must satisfy 0 <= start < end <= {output_len}.")
+
+    y_indices = list(range(start_y, end_y))
+    if prompt_len is None:
+        label_indices = y_indices
+    else:
+        label_indices = [prompt_len + idx for idx in y_indices if prompt_len + idx < len(sequence_ids)]
+
+    show_token_labels = tokenizer is not None and sequence_ids is not None
+    if show_token_labels:
+        sequence_ids = sequence_ids.detach().cpu()
+        if sequence_ids.dim() > 1:
+            sequence_ids = sequence_ids[0]
+        x_ticks, x_labels = _token_ticks_and_labels(tokenizer, sequence_ids, label_indices)
+
+    fig, axes = plt.subplots(
+        len(selected_layers),
+        len(selected_heads),
+        figsize=figsize,
+        squeeze=False,
+    )
+
+    for row, layer_idx in enumerate(selected_layers):
+        layer_attn = one_dimensional_attn_weights[layer_idx]
+        for col, head_idx in enumerate(selected_heads):
+            ax = axes[row, col]
+            values = layer_attn[0, head_idx, start_y:end_y]
+            if values.dim() > 1 and values.shape[-1] == 1:
+                values = values.squeeze(-1)
+            elif values.dim() > 1:
+                values = values.sum(dim=-1)
+
+            ax.bar(range(len(y_indices)), values.detach().cpu().numpy(), color=color)
+
+            if show_token_labels:
+                ax.set_xticks(x_ticks)
+                ax.set_xticklabels(x_labels, rotation=90, fontsize=label_fontsize)
+                ax.tick_params(axis="x", length=0, pad=1)
+                ax.set_xlim(min(x_ticks) - 0.5, max(x_ticks) + 0.5)
+            else:
+                ax.set_xticks([])
+
+            if row == 0:
+                ax.set_title(f"H{head_idx}", fontsize=9)
+            if col == 0:
+                ax.set_ylabel(f"L{layer_idx}", fontsize=8)
+
+    fig.suptitle("Selective attention mass to leveraging-context cluster", y=1.0)
+    if tight:
+        fig.tight_layout(pad=0.3)
+    else:
+        fig.subplots_adjust(left=0.02, right=0.995, bottom=0.02, top=0.99, wspace=0.15, hspace=0.15)
+
+    if out_path:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save_kwargs = {"dpi": dpi}
+        if tight:
+            save_kwargs["bbox_inches"] = "tight"
+        fig.savefig(out_path, **save_kwargs)
+
+    return fig, axes
+
+def plot_aggregated_attention_map(
     attn_weights,
     input_range: tuple=(None, None),
     output_range: tuple=(None, None),
