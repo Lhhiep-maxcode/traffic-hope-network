@@ -1,4 +1,0 @@
-accelerate
-matplotlib
-torch
-transformers
