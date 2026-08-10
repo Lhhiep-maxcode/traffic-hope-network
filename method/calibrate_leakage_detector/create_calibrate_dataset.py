@@ -16,8 +16,10 @@ LEAKAGE_INSTRUCTION = (
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--generation-model", required=True)
+    parser.add_argument("--phase", default="all", choices=["generate", "judge", "all"])
+    parser.add_argument("--generation-model", nargs="+", default=None)
     parser.add_argument("--judge-model", default=None)
+    parser.add_argument("--input-path", type=Path, default=None)
     parser.add_argument("--dataset", default="HuggingFaceH4/MATH-500")
     parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--split", default="test")
@@ -44,8 +46,15 @@ def model_slug(model_name: str) -> str:
     return name[:1].lower() + name[1:]
 
 
-def default_output_path(model_name: str) -> Path:
-    return Path(__file__).with_name(f"{model_slug(model_name)}-calibrate-dataset.jsonl")
+def model_tag(model_names: list[str]) -> str:
+    return "-".join(model_slug(name) for name in model_names)
+
+
+def default_output_path(args) -> Path:
+    if args.phase == "judge":
+        return args.input_path.with_name(f"{args.input_path.stem}-calibrate-dataset.jsonl")
+    suffix = "responses" if args.phase == "generate" else "calibrate-dataset"
+    return Path(__file__).with_name(f"{model_tag(args.generation_model)}-{suffix}.jsonl")
 
 
 def braced_blocks(text: str, command: str) -> list[str]:
@@ -192,60 +201,116 @@ def leakage_spans(judge_output: str, response: str) -> list[str]:
     return spans
 
 
-def main():
-    args = parse_args()
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be >= 1")
-    args.judge_model = args.judge_model or args.generation_model
-    output_path = args.output_path or default_output_path(args.generation_model)
-    if output_path.exists() and not args.overwrite:
-        raise FileExistsError(f"{output_path} exists. Use --overwrite to replace it.")
+def write_jsonl(rows: list[dict], path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        for row in rows:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+
+def read_jsonl(path: Path) -> list[dict]:
+    with path.open("r", encoding="utf-8") as file:
+        return [json.loads(line) for line in file if line.strip()]
+
+
+def clear_model_memory():
+    import gc
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def generate_rows(args) -> list[dict]:
     seeds = load_seed_examples(args)
     print(f"Loaded {len(seeds)} seed examples from {args.dataset}/{args.split}")
 
-    print(f"Loading generation model: {args.generation_model}")
-    generator, generator_tokenizer = load_lm(args.generation_model, args)
-    if args.judge_model == args.generation_model:
-        judge, judge_tokenizer = generator, generator_tokenizer
-    else:
-        print(f"Loading judge model: {args.judge_model}")
-        judge, judge_tokenizer = load_lm(args.judge_model, args)
+    rows = []
+    for model_name in args.generation_model:
+        print(f"Loading generation model: {model_name}")
+        model, tokenizer = load_lm(model_name, args)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as file:
-        for start in tqdm(range(0, len(seeds), args.batch_size), desc="Creating calibration dataset", unit="batch"):
+        batches = range(0, len(seeds), args.batch_size)
+        for start in tqdm(batches, desc=f"Generating {model_slug(model_name)}", unit="batch"):
             batch = seeds[start : start + args.batch_size]
             prompts = [build_prompt(seed["problem"], seed["answer"]) for seed in batch]
             responses = generate_batch(
-                generator,
-                generator_tokenizer,
+                model,
+                tokenizer,
                 prompts,
                 args.generation_max_new_tokens,
                 args.generation_temperature,
                 enable_thinking=None if not args.disable_thinking else False,
             )
-            judge_prompts = [
-                USER_PROMPT.format(prompt=prompt, response=response)
+            rows.extend(
+                {"generation_model": model_name, "prompt": prompt, "response": response}
                 for prompt, response in zip(prompts, responses)
+            )
+        del model, tokenizer
+        clear_model_memory()
+    return rows
+
+
+def judge_rows(args, rows: list[dict], output_path: Path):
+    print(f"Loading judge model: {args.judge_model}")
+    judge, tokenizer = load_lm(args.judge_model, args)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as file:
+        batches = range(0, len(rows), args.batch_size)
+        for start in tqdm(batches, desc="Detecting leakage", unit="batch"):
+            batch = rows[start : start + args.batch_size]
+            judge_prompts = [
+                USER_PROMPT.format(prompt=row["prompt"], response=row["response"])
+                for row in batch
             ]
             judge_outputs = generate_batch(
                 judge,
-                judge_tokenizer,
+                tokenizer,
                 judge_prompts,
                 args.judge_max_new_tokens,
                 temperature=0.0,
                 enable_thinking=False,
                 system_prompt=SYSTEM_PROMPT,
             )
+            for row, judge_output in zip(batch, judge_outputs):
+                file.write(
+                    json.dumps(
+                        {
+                            "prompt": row["prompt"],
+                            "response": row["response"],
+                            "leakage_spans": leakage_spans(judge_output, row["response"]),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
 
-            for prompt, response, judge_output in zip(prompts, responses, judge_outputs):
-                row = {
-                    "prompt": prompt,
-                    "response": response,
-                    "leakage_spans": leakage_spans(judge_output, response),
-                }
-                file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+def main():
+    args = parse_args()
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+    if args.phase in {"generate", "all"} and not args.generation_model:
+        raise ValueError("--generation-model is required for --phase generate/all")
+    if args.phase == "judge" and args.input_path is None:
+        raise ValueError("--input-path is required for --phase judge")
+    if args.phase == "judge" and not args.judge_model:
+        raise ValueError("--judge-model is required for --phase judge")
+    if args.phase == "all":
+        args.judge_model = args.judge_model or args.generation_model[0]
+
+    output_path = args.output_path or default_output_path(args)
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"{output_path} exists. Use --overwrite to replace it.")
+
+    if args.phase == "generate":
+        write_jsonl(generate_rows(args), output_path)
+    elif args.phase == "judge":
+        judge_rows(args, read_jsonl(args.input_path), output_path)
+    else:
+        judge_rows(args, generate_rows(args), output_path)
 
     print(f"Saved {output_path}")
 
