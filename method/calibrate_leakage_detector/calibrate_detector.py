@@ -35,6 +35,7 @@ def parse_args():
     parser.add_argument("--calibrate-path", type=Path, default=base / "generated-responses-with-leakage-spans.jsonl")
     parser.add_argument("--test-path", type=Path, default=base / "test-generated-responses-with-leakage.jsonl")
     parser.add_argument("--result-path", type=Path, default=base / "calibrate_result.jsonl")
+    parser.add_argument("--score-cache-path", type=Path, default=base / "calibrate_head_scores.pt")
     parser.add_argument("--eval-path", type=Path, default=base / "calibrate_eval_result.jsonl")
     parser.add_argument("--plot-dir", type=Path, default=base / "lowest_score_plots")
     parser.add_argument("--plot-lowest-n", type=int, default=0)
@@ -46,6 +47,7 @@ def parse_args():
     parser.add_argument("--dtype", default="float16", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--disable-thinking", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--from-cache", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -184,6 +186,32 @@ def top_heads(scores: torch.Tensor, top_k: int) -> list[dict]:
     ]
 
 
+def save_selected_heads(scores: torch.Tensor, args):
+    ranked = top_heads(scores, args.top_k)
+    heads = [{"layer": item["layer"], "head": item["head"]} for item in ranked]
+    write_jsonl([{model_name_key(args.model): heads}], args.result_path, args.overwrite)
+    for item in ranked:
+        print(f"L{item['layer']} H{item['head']} cosine={item['score']:.4f}")
+
+
+def save_score_cache(scores: torch.Tensor, used: int, args):
+    if args.score_cache_path.exists() and not args.overwrite:
+        raise FileExistsError(f"{args.score_cache_path} exists. Use --overwrite to replace it.")
+    args.score_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"model": model_name_key(args.model), "scores": scores.cpu(), "used": used},
+        args.score_cache_path,
+    )
+
+
+def calibrate_from_cache(args):
+    cache = torch.load(args.score_cache_path, map_location="cpu")
+    if cache.get("model") != model_name_key(args.model):
+        raise ValueError(f"Cache is for {cache.get('model')}, but --model is {model_name_key(args.model)}.")
+    save_selected_heads(cache["scores"], args)
+    print(f"Loaded scores from {args.score_cache_path}. Used {cache.get('used')} cached samples.")
+
+
 def calibrate(model, tokenizer, args):
     rows = [row for row in read_jsonl(args.calibrate_path) if row.get("leakage_spans")]
     rows = rows[: args.max_samples] if args.max_samples else rows
@@ -204,13 +232,11 @@ def calibrate(model, tokenizer, args):
     if used == 0:
         raise RuntimeError("No usable calibration samples.")
 
-    ranked = top_heads(total_scores / used, args.top_k)
-    heads = [{"layer": item["layer"], "head": item["head"]} for item in ranked]
-    write_jsonl([{model_name_key(args.model): heads}], args.result_path, args.overwrite)
-
+    scores = total_scores / used
+    save_score_cache(scores, used, args)
+    save_selected_heads(scores, args)
     print(f"Used {used} samples.")
-    for item in ranked:
-        print(f"L{item['layer']} H{item['head']} cosine={item['score']:.4f}")
+    print(f"Saved score cache to {args.score_cache_path}.")
 
 
 def read_heads(path: Path, model: str) -> list[dict]:
@@ -262,6 +288,10 @@ def evaluate(model, tokenizer, args):
 
 def main():
     args = parse_args()
+    if args.phase == "calibrate" and args.from_cache:
+        calibrate_from_cache(args)
+        return
+
     model, tokenizer = load_model_and_tokenizer(
         model=args.model, 
         attn_implementation=args.attn_implementation,
@@ -270,7 +300,10 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
     if args.phase == "total":
-        calibrate(model, tokenizer, args)
+        if args.from_cache:
+            calibrate_from_cache(args)
+        else:
+            calibrate(model, tokenizer, args)
         evaluate(model, tokenizer, args)
     elif args.phase == "calibrate":
         calibrate(model, tokenizer, args)

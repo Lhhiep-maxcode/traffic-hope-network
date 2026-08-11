@@ -33,6 +33,7 @@ This writes:
 
 ```text
 method/calibrate_leakage_detector/calibrate_result.jsonl
+method/calibrate_leakage_detector/calibrate_head_scores.pt
 ```
 
 Example format:
@@ -40,6 +41,21 @@ Example format:
 ```json
 {"Qwen3-4B": [{"layer": 25, "head": 9}, {"layer": 30, "head": 21}]}
 ```
+
+## Reuse Calibration Cache
+
+After one full calibration, you can change `--top-k` without recomputing attentions:
+
+```bash
+python method/calibrate_leakage_detector/calibrate_detector.py \
+  --phase calibrate \
+  --model Qwen/Qwen3-4B \
+  --from-cache \
+  --top-k 16 \
+  --overwrite
+```
+
+This reloads `calibrate_head_scores.pt` and rewrites only `calibrate_result.jsonl`.
 
 ## 2. Evaluate Heads
 
@@ -73,6 +89,7 @@ python method/calibrate_leakage_detector/calibrate_detector.py \
 
 ```text
 --top-k              Number of best attention heads to keep.
+--from-cache         Reuse cached calibration scores and only reselect top-k heads.
 --max-samples        Use only the first N leakage samples.
 --max-seq-len        Skip samples longer than this many tokens.
 --disable-thinking   Render Qwen chat template with thinking disabled.
