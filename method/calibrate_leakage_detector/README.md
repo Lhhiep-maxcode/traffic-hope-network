@@ -26,6 +26,7 @@ python method/calibrate_leakage_detector/calibrate_detector.py \
   --phase calibrate \
   --model Qwen/Qwen3-4B \
   --top-k 8 \
+  --batch-size 2 \
   --overwrite
 ```
 
@@ -63,6 +64,7 @@ This reloads `calibrate_head_scores.pt` and rewrites only `calibrate_result.json
 python method/calibrate_leakage_detector/calibrate_detector.py \
   --phase evaluate \
   --model Qwen/Qwen3-4B \
+  --batch-size 2 \
   --plot-lowest-n 5 \
   --overwrite
 ```
@@ -81,6 +83,7 @@ python method/calibrate_leakage_detector/calibrate_detector.py \
   --phase total \
   --model Qwen/Qwen3-4B \
   --top-k 8 \
+  --batch-size 2 \
   --plot-lowest-n 5 \
   --overwrite
 ```
@@ -89,6 +92,7 @@ python method/calibrate_leakage_detector/calibrate_detector.py \
 
 ```text
 --top-k              Number of best attention heads to keep.
+--batch-size         Number of samples per attention forward pass.
 --from-cache         Reuse cached calibration scores and only reselect top-k heads.
 --max-samples        Use only the first N leakage samples.
 --max-seq-len        Skip samples longer than this many tokens.
@@ -99,3 +103,4 @@ python method/calibrate_leakage_detector/calibrate_detector.py \
 ```
 
 The default attention backend is `eager`, which is safest for `output_attentions=True`.
+If CUDA memory is too high, lower `--batch-size` or `--max-seq-len`.

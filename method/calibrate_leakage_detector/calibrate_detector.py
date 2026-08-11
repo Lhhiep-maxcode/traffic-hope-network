@@ -23,7 +23,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 from tqdm import tqdm
-from utils.utils import load_model_and_tokenizer, build_prompt, get_attention_weights
+from utils.utils import load_model_and_tokenizer, build_prompt
 
 
 
@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("--plot-dir", type=Path, default=base / "lowest_score_plots")
     parser.add_argument("--plot-lowest-n", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=8)     # how many attn heads to keep/choose
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=None)    # how many samples to use
     parser.add_argument("--max-seq-len", type=int, default=2048)    # skip samples where seq-len > max-seq-len
     parser.add_argument("--attn-implementation", default="eager")
@@ -147,6 +148,52 @@ def build_sample(row: dict, tokenizer, args) -> dict | None:
 def model_device(model):
     return model.device if hasattr(model, "device") else next(model.parameters()).device
 
+
+def batches(items, batch_size: int):
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
+
+
+def pad_token_id(tokenizer) -> int:
+    if tokenizer.pad_token_id is not None:
+        return tokenizer.pad_token_id
+    if tokenizer.eos_token_id is not None:
+        return tokenizer.eos_token_id
+    return 0
+
+
+def get_batch_attention_weights(model, tokenizer, samples: list[dict]):
+    max_len = max(len(sample["input_ids"]) for sample in samples)
+    input_ids = torch.full((len(samples), max_len), pad_token_id(tokenizer), dtype=torch.long)
+    attention_mask = torch.zeros((len(samples), max_len), dtype=torch.long)
+
+    for row, sample in enumerate(samples):
+        seq_len = len(sample["input_ids"])
+        input_ids[row, :seq_len] = sample["input_ids"]
+        attention_mask[row, :seq_len] = 1
+
+    input_ids = input_ids.to(model_device(model))
+    attention_mask = attention_mask.to(model_device(model))
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_attentions=True,
+            use_cache=False,
+            return_dict=True,
+        )
+    if outputs.attentions is None:
+        raise RuntimeError("No attentions returned. Use --attn-implementation eager.")
+    return tuple(attn.detach().float().cpu() for attn in outputs.attentions)
+
+
+def take_sample_attentions(batch_attentions, batch_idx: int, seq_len: int):
+    return tuple(
+        layer_attn[batch_idx : batch_idx + 1, :, :seq_len, :seq_len]
+        for layer_attn in batch_attentions
+    )
+
+
 def attention_to_context(attentions, prompt_len: int, key_tokens: list[int]) -> torch.Tensor:
     key_tokens = torch.tensor(key_tokens)
     vectors = []
@@ -215,18 +262,18 @@ def calibrate_from_cache(args):
 def calibrate(model, tokenizer, args):
     rows = [row for row in read_jsonl(args.calibrate_path) if row.get("leakage_spans")]
     rows = rows[: args.max_samples] if args.max_samples else rows
+    samples = [sample for row in rows if (sample := build_sample(row, tokenizer, args)) is not None]
 
     total_scores = None
     used = 0
-    for row in tqdm(rows, desc="Calibrating"):
-        sample = build_sample(row, tokenizer, args)
-        if sample is None:
-            continue
-        attentions, _ = get_attention_weights(model, sample["input_ids"])
-        scores = score_all_heads_and_layers(attentions, sample)
-        total_scores = scores if total_scores is None else total_scores + scores
-        used += 1
-        del attentions
+    for batch in tqdm(list(batches(samples, args.batch_size)), desc="Calibrating"):
+        batch_attentions = get_batch_attention_weights(model, tokenizer, batch)
+        for batch_idx, sample in enumerate(batch):
+            attentions = take_sample_attentions(batch_attentions, batch_idx, len(sample["input_ids"]))
+            scores = score_all_heads_and_layers(attentions, sample)
+            total_scores = scores if total_scores is None else total_scores + scores
+            used += 1
+        del batch_attentions
         clear_memory()
 
     if used == 0:
@@ -262,19 +309,24 @@ def evaluate(model, tokenizer, args):
     heads = read_heads(args.result_path, args.model)
     rows = [row for row in read_jsonl(args.test_path) if row.get("leakage_spans")]
     rows = rows[: args.max_samples] if args.max_samples else rows
+    samples = [
+        (sample_id, sample)
+        for sample_id, row in enumerate(rows, 1)
+        if (sample := build_sample(row, tokenizer, args)) is not None
+    ]
 
     results = []
     plots = []
-    for sample_id, row in tqdm(list(enumerate(rows, 1)), desc="Evaluating"):
-        sample = build_sample(row, tokenizer, args)
-        if sample is None:
-            continue
-        attentions, _ = get_attention_weights(model, sample["input_ids"])
-        score, real = score_selected_heads_and_layers(attentions, sample, heads)
-        results.append({"sample_id": sample_id, "score": score})
-        if args.plot_lowest_n:
-            plots.append((score, sample_id, real, sample["ideal"]))
-        del attentions
+    for batch in tqdm(list(batches(samples, args.batch_size)), desc="Evaluating"):
+        batch_samples = [sample for _, sample in batch]
+        batch_attentions = get_batch_attention_weights(model, tokenizer, batch_samples)
+        for batch_idx, (sample_id, sample) in enumerate(batch):
+            attentions = take_sample_attentions(batch_attentions, batch_idx, len(sample["input_ids"]))
+            score, real = score_selected_heads_and_layers(attentions, sample, heads)
+            results.append({"sample_id": sample_id, "score": score})
+            if args.plot_lowest_n:
+                plots.append((score, sample_id, real, sample["ideal"]))
+        del batch_attentions
         clear_memory()
 
     write_jsonl(results, args.eval_path, args.overwrite)
@@ -288,6 +340,8 @@ def evaluate(model, tokenizer, args):
 
 def main():
     args = parse_args()
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
     if args.phase == "calibrate" and args.from_cache:
         calibrate_from_cache(args)
         return
