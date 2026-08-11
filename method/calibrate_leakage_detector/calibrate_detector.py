@@ -30,7 +30,7 @@ from utils.utils import load_model_and_tokenizer, build_prompt, get_attention_we
 def parse_args():
     base = Path(__file__).parent
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=["calibrate", "evaluate"], default="calibrate")
+    parser.add_argument("--phase", choices=["calibrate", "evaluate", "total"], default="calibrate")
     parser.add_argument("--model", required=True)
     parser.add_argument("--calibrate-path", type=Path, default=base / "generated-responses-with-leakage-spans.jsonl")
     parser.add_argument("--test-path", type=Path, default=base / "test-generated-responses-with-leakage.jsonl")
@@ -73,8 +73,6 @@ def write_jsonl(rows: list[dict], path: Path, overwrite: bool):
 
 
 def privileged_context(prompt: str) -> str | None:
-    if prompt.get("privileged_context", ""):
-        return prompt["privileged_context"]
     start = prompt.find("Given the ground truth answer is ")
     if start < 0:
         return None
@@ -196,7 +194,7 @@ def calibrate(model, tokenizer, args):
         sample = build_sample(row, tokenizer, args)
         if sample is None:
             continue
-        attentions = get_attention_weights(model, sample["input_ids"])
+        attentions, _ = get_attention_weights(model, sample["input_ids"])
         scores = score_all_heads_and_layers(attentions, sample)
         total_scores = scores if total_scores is None else total_scores + scores
         used += 1
@@ -245,7 +243,7 @@ def evaluate(model, tokenizer, args):
         sample = build_sample(row, tokenizer, args)
         if sample is None:
             continue
-        attentions = get_attention_weights(model, sample["input_ids"])
+        attentions, _ = get_attention_weights(model, sample["input_ids"])
         score, real = score_selected_heads_and_layers(attentions, sample, heads)
         results.append({"sample_id": sample_id, "score": score})
         if args.plot_lowest_n:
@@ -271,7 +269,10 @@ def main():
         dtype=torch_dtype(args.dtype),
         trust_remote_code=args.trust_remote_code,
     )
-    if args.phase == "calibrate":
+    if args.phase == "total":
+        calibrate(model, tokenizer, args)
+        evaluate(model, tokenizer, args)
+    elif args.phase == "calibrate":
         calibrate(model, tokenizer, args)
     else:
         evaluate(model, tokenizer, args)
