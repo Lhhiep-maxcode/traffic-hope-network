@@ -221,7 +221,14 @@ def score_selected_heads_and_layers(attentions, sample: dict, heads: list[dict])
 def clear_memory():
     gc.collect()
     if torch.cuda.is_available():
+        torch.cuda.ipc_collect()
         torch.cuda.empty_cache()
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def top_heads(scores: torch.Tensor, top_k: int) -> list[dict]:
