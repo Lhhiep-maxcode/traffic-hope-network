@@ -17,16 +17,15 @@ python method/calibrate_leakage_detector/calibrate_detector.py \
   --top-k-values 1,2,4,8,16,32 \
   --batch-size 2 \
   --window-sizes 1,3,5,7 \
-  --num-thresholds 80 \
+  --threshold-steps 80 \
   --overwrite
 ```
 
 This writes:
 
 ```text
-method/calibrate_leakage_detector/calibrate_result.jsonl
 method/calibrate_leakage_detector/calibrate_head_scores.pt
-method/calibrate_leakage_detector/threshold_calibration_metrics.jsonl
+method/calibrate_leakage_detector/all_experiments.jsonl
 method/calibrate_leakage_detector/detector_config.json
 ```
 
@@ -38,7 +37,7 @@ cosine(positive_median_normalized_attention, ideal_mask) * positive_contrast
 
 The final detector aggregates selected heads by normalizing each head first, then using the calibrated head scores as weights.
 
-When `--top-k-values` is provided, the script calibrates each candidate `k`, then chooses the detector with recall/full-recall equal to `1.0`, highest precision, smallest `k`, smallest window, and highest threshold. The metrics JSONL contains every tested `(top_k, window_size, threshold)` row.
+When `--top-k-values` is provided, the script calibrates each candidate `k`, then chooses the detector with recall/full-recall equal to `1.0`, highest precision, smallest `k`, smallest window, and highest threshold. `all_experiments.jsonl` contains every tested `(model, top_k, window_size, threshold)` row.
 
 ## Evaluate
 
@@ -51,7 +50,7 @@ python method/calibrate_leakage_detector/calibrate_detector.py \
   --overwrite
 ```
 
-This reads `detector_config.json`, writes `calibrate_eval_result.jsonl`, and optionally plots the lowest-scoring samples.
+This reads `detector_config.json`, updates that model's aggregate test metrics inside the same file, and optionally plots the lowest-scoring samples.
 
 ## Calibrate And Evaluate
 

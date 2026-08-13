@@ -30,11 +30,9 @@ def parse_args():
     parser.add_argument("--calibrate-path", type=Path, default=base / "generated-responses-with-leakage-spans.jsonl")
     parser.add_argument("--val-calibrate-path", type=Path, default=base / "val-generated-responses-with-leakage-spans.jsonl")
     parser.add_argument("--test-path", type=Path, default=base / "test-generated-responses-with-leakage.jsonl")
-    parser.add_argument("--result-path", type=Path, default=base / "calibrate_result.jsonl")
     parser.add_argument("--detector-config-path", type=Path, default=base / "detector_config.json")
     parser.add_argument("--score-cache-path", type=Path, default=base / "calibrate_head_scores.pt")
-    parser.add_argument("--threshold-metrics-path", type=Path, default=base / "threshold_calibration_metrics.jsonl")
-    parser.add_argument("--eval-path", type=Path, default=base / "calibrate_eval_result.jsonl")
+    parser.add_argument("--all-experiments-path", type=Path, default=base / "all_experiments.jsonl")
     parser.add_argument("--plot-dir", type=Path, default=base / "lowest_score_plots")
     parser.add_argument("--plot-lowest-n", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=8)
@@ -69,17 +67,27 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def write_jsonl(rows: list[dict], path: Path, overwrite: bool):
-    if path.exists() and not overwrite:
-        raise FileExistsError(f"{path} exists. Use --overwrite to replace it.")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    mode = "w" if overwrite or not path.exists() else "a"
+    with path.open(mode, encoding="utf-8") as file:
+        file.write("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
 
 
-def write_json(row: dict, path: Path, overwrite: bool):
-    if path.exists() and not overwrite:
-        raise FileExistsError(f"{path} exists. Use --overwrite to replace it.")
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def write_json(row: dict, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_detector(args) -> dict:
+    key = model_name_key(args.model)
+    config = read_json(args.detector_config_path)
+    if key not in config:
+        raise KeyError(f"No detector config for {key} in {args.detector_config_path}.")
+    return config[key]
 
 
 def int_grid(text: str | None, default: int | None = None, max_value: int | None = None) -> list[int]:
@@ -356,9 +364,6 @@ def build_samples(path: Path, tokenizer, args):
 
 
 def calibrate_head_scores(model, tokenizer, samples: list[dict], args) -> torch.Tensor:
-    if args.score_cache_path.exists() and not args.overwrite:
-        raise FileExistsError(f"{args.score_cache_path} exists. Use --overwrite to replace it.")
-
     total, used = None, 0
     for batch in tqdm(list(batches(samples, args.batch_size)), desc="Calibrating heads"):
         batch_attn = get_batch_attention_weights(model, tokenizer, batch)
@@ -404,29 +409,49 @@ def detector_records_by_k(model, tokenizer, samples: list[dict], scores: torch.T
 
 
 def save_detector_config(heads: list[dict], best: dict, args):
-    config = {
-        "model": model_name_key(args.model),
+    key = model_name_key(args.model)
+    config = read_json(args.detector_config_path)
+
+    config[key] = {
         "top_k": best["top_k"],
         "top_k_values": best["top_k_values"],
         "heads": heads,
         "aggregation": args.aggregation,
-        "aggregation_normalization": "per_head_positive_median",
-        "head_score": "cosine(normalized_attention, ideal) * positive_contrast",
         "window_size": best["window_size"],
         "threshold": best["threshold"],
         "val_calibration_precision": best["precision"],
         "val_calibration_recall": best["recall"],
         "val_calibration_full_recall": best["full_recall"],
+        "test_precision": None,
+        "test_recall": None,
+        "test_full_recall": None,
     }
-    write_json(config, args.detector_config_path, args.overwrite)
-    write_jsonl([{model_name_key(args.model): heads}], args.result_path, args.overwrite)
+    write_json(config, args.detector_config_path)
     print(
         f"top_k={best['top_k']} threshold={best['threshold']:.6g} window={best['window_size']} "
         f"precision={best['precision']:.4f} recall={best['recall']:.4f}"
     )
 
 
+def save_test_metrics(args, precision: float, recall: float, full_recall: float):
+    key = model_name_key(args.model)
+    config = read_json(args.detector_config_path)
+    if key not in config:
+        raise KeyError(f"No detector config for {key} in {args.detector_config_path}.")
+    config[key].update({
+        "test_precision": precision,
+        "test_recall": recall,
+        "test_full_recall": full_recall,
+    })
+    write_json(config, args.detector_config_path)
+
+
 def calibrate(model, tokenizer, args):
+    key = model_name_key(args.model)
+    if key in read_json(args.detector_config_path) and not args.overwrite:
+        print(f"Detector for {key} already exists in {args.detector_config_path}. Skipping calibration.")
+        return
+
     samples = build_samples(args.calibrate_path, tokenizer, args)
     val_samples = build_samples(args.val_calibrate_path, tokenizer, args)
     scores = load_head_scores(args) if args.from_cache else calibrate_head_scores(model, tokenizer, samples, args)
@@ -438,12 +463,12 @@ def calibrate(model, tokenizer, args):
 
     all_metrics = []
     for k in top_ks:
-        rows = [{**row, "top_k": k} for row in threshold_metrics(records_by_k[k], args)]
+        rows = [{**row, "model": key, "top_k": k} for row in threshold_metrics(records_by_k[k], args)]
         all_metrics.extend(rows)
 
     best = choose_config(all_metrics)
     best["top_k_values"] = top_ks
-    write_jsonl(all_metrics, args.threshold_metrics_path, args.overwrite)
+    write_jsonl(all_metrics, args.all_experiments_path, args.overwrite)
     save_detector_config(heads_by_k[best["top_k"]], best, args)
 
 
@@ -463,13 +488,13 @@ def plot_sample(real: torch.Tensor, ideal: torch.Tensor, score: float, out_path:
 
 
 def evaluate(model, tokenizer, args):
-    detector = json.loads(args.detector_config_path.read_text(encoding="utf-8"))
+    detector = read_detector(args)
     samples = [(i, s) for i, s in enumerate(build_samples(args.test_path, tokenizer, args), 1)]
     heads, threshold = detector["heads"], float(detector["threshold"])
     window_size = int(detector["window_size"])
     aggregation = detector.get("aggregation", args.aggregation)
 
-    results, plots, total = [], [], {"tp": 0, "fp": 0, "fn": 0, "full_hits": 0}
+    plots, total = [], {"tp": 0, "fp": 0, "fn": 0, "full_hits": 0}
     for batch in tqdm(list(batches(samples, args.batch_size)), desc="Evaluating"):
         batch_attn = get_batch_attention_weights(model, tokenizer, [sample for _, sample in batch])
         for batch_idx, (sample_id, sample) in enumerate(batch):
@@ -477,7 +502,6 @@ def evaluate(model, tokenizer, args):
             real = rolling_max(aggregate_selected_heads(sample_attn, sample, heads, aggregation), window_size)
             score = float(cosine(real, sample["ideal"]))
             stats, pred = metric_row(real, sample["ideal"], threshold)
-            results.append({"sample_id": sample_id, "score": score, **stats, "predicted_token_spans": token_spans(pred)})
             total["tp"] += stats["tp"]
             total["fp"] += stats["fp"]
             total["fn"] += stats["fn"]
@@ -487,13 +511,13 @@ def evaluate(model, tokenizer, args):
         del batch_attn
         clear_memory()
 
-    write_jsonl(results, args.eval_path, args.overwrite)
     for rank, (score, sample_id, real, ideal) in enumerate(sorted(plots)[: args.plot_lowest_n], 1):
         plot_sample(real, ideal, score, args.plot_dir / f"lowest_{rank:02d}_sample_{sample_id:04d}.png", threshold)
 
     precision = total["tp"] / max(total["tp"] + total["fp"], 1)
     recall = total["tp"] / max(total["tp"] + total["fn"], 1)
-    full_recall = total["full_hits"] / max(len(results), 1)
+    full_recall = total["full_hits"] / max(len(samples), 1)
+    save_test_metrics(args, precision, recall, full_recall)
     print(f"precision={precision:.4f} recall={recall:.4f} full_recall={full_recall:.4f}")
 
 
@@ -501,7 +525,7 @@ def main():
     args = parse_args()
     if args.batch_size < 1 or args.threshold_steps < 1:
         raise ValueError("--batch-size and --threshold-steps must be positive.")
-    for path in (args.score_cache_path, args.threshold_metrics_path):
+    for path in (args.score_cache_path, args.all_experiments_path):
         path.parent.mkdir(parents=True, exist_ok=True)
 
     model, tokenizer = load_model_and_tokenizer(
