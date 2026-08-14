@@ -1,3 +1,5 @@
+import json
+
 import torch
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -410,3 +412,26 @@ def plot_aggregated_attention_map(
         fig.savefig(out_path, dpi=dpi)
 
     return attn_map, fig, ax
+
+def torch_dtype(name: str):
+    return "auto" if name == "auto" else getattr(torch, name)
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def write_jsonl(rows: list[dict], path: Path, overwrite: bool):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "w" if overwrite or not path.exists() else "a"
+    with path.open(mode, encoding="utf-8") as file:
+        file.write("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def write_json(row: dict, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")

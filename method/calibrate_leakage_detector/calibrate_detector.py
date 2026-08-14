@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.utils import build_prompt, load_model_and_tokenizer
+from utils.utils import build_prompt, load_model_and_tokenizer, read_json, read_jsonl, write_json, write_jsonl, torch_dtype
 
 EPS = 1e-12
 PRIVILEGED_MARKER = "Given the ground truth answer is "
@@ -58,30 +58,6 @@ def parse_args():
 def model_name_key(model: str) -> str:
     name = re.split(r"[\\/]", model.rstrip("\\/"))[-1]
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-")
-
-
-def torch_dtype(name: str):
-    return "auto" if name == "auto" else getattr(torch, name)
-
-
-def read_jsonl(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-
-
-def write_jsonl(rows: list[dict], path: Path, overwrite: bool):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = "w" if overwrite or not path.exists() else "a"
-    with path.open(mode, encoding="utf-8") as file:
-        file.write("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
-
-
-def read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-
-
-def write_json(row: dict, path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_detector(args) -> dict:
@@ -293,30 +269,55 @@ def token_spans(mask: torch.Tensor) -> list[dict]:
 
 def metric_row(real: torch.Tensor, ideal: torch.Tensor, threshold: float) -> tuple[dict, torch.Tensor]:
     pred, gold = real >= threshold, ideal.bool()
-    tp, fp, fn = int((pred & gold).sum()), int((pred & ~gold).sum()), int((~pred & gold).sum())
+    gold_spans = token_spans(gold)
+    pred_spans = token_spans(pred)
+    gold_starts = [span["start_token"] for span in gold_spans]
+
+    detected_gold_spans = sum(int(bool(pred[start])) for start in gold_starts)
+    correct_pred_spans = sum(
+        int(any(span["start_token"] <= start < span["end_token"] for start in gold_starts))
+        for span in pred_spans
+    )
+    missed_gold_spans = len(gold_spans) - detected_gold_spans
+    false_pred_spans = len(pred_spans) - correct_pred_spans
+
     return {
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "precision": tp / max(tp + fp, 1),
-        "recall": tp / max(tp + fn, 1),
-        "full_recall": float(bool(pred[gold].all())) if gold.any() else 1.0,
+        "detected_gold_spans": detected_gold_spans,
+        "missed_gold_spans": missed_gold_spans,
+        "total_gold_spans": len(gold_spans),
+        "correct_pred_spans": correct_pred_spans,
+        "false_pred_spans": false_pred_spans,
+        "total_pred_spans": len(pred_spans),
+        "precision": correct_pred_spans / max(len(pred_spans), 1),
+        "recall": detected_gold_spans / max(len(gold_spans), 1),
+        "full_recall": float(detected_gold_spans == len(gold_spans)),
     }, pred
 
 
 def pooled_metrics(records: list[dict], window_size: int, threshold: float) -> dict:
-    total = {"tp": 0, "fp": 0, "fn": 0, "full_hits": 0}
+    total = {
+        "detected_gold_spans": 0,
+        "missed_gold_spans": 0,
+        "correct_pred_spans": 0,
+        "false_pred_spans": 0,
+        "full_hits": 0,
+    }
     for record in records:
         stats, _ = metric_row(rolling_max(record["real"], window_size), record["ideal"], threshold)
-        total["tp"] += stats["tp"]
-        total["fp"] += stats["fp"]
-        total["fn"] += stats["fn"]
+        total["detected_gold_spans"] += stats["detected_gold_spans"]
+        total["missed_gold_spans"] += stats["missed_gold_spans"]
+        total["correct_pred_spans"] += stats["correct_pred_spans"]
+        total["false_pred_spans"] += stats["false_pred_spans"]
         total["full_hits"] += int(stats["full_recall"] == 1.0)
     return {
         "window_size": window_size,
         "threshold": float(threshold),
-        "precision": total["tp"] / max(total["tp"] + total["fp"], 1),
-        "recall": total["tp"] / max(total["tp"] + total["fn"], 1),
+        "precision": total["correct_pred_spans"] / max(
+            total["correct_pred_spans"] + total["false_pred_spans"], 1
+        ),
+        "recall": total["detected_gold_spans"] / max(
+            total["detected_gold_spans"] + total["missed_gold_spans"], 1
+        ),
         "full_recall": total["full_hits"] / max(len(records), 1),
         **total,
         "samples": len(records),
@@ -339,7 +340,7 @@ def choose_config(rows: list[dict]) -> dict:
     key = lambda r: (r["precision"], -r.get("top_k", 0), -r["window_size"], r["threshold"])
     if feasible:
         return max(feasible, key=key)
-    return max(rows, key=lambda r: (r["full_recall"], r["recall"], r["precision"], -r.get("top_k", 0)))
+    return max(rows, key=lambda r: (r["full_recall"], r["recall"], r["precision"], -r.get("top_k", 0), -r["window_size"], r["threshold"]))
 
 
 def clear_memory():
@@ -507,7 +508,8 @@ def plot_sample(
 
     ax.set_title(
         f"cosine={score:.4f} "
-        f"precision={stats['precision']:.4f} recall={stats['recall']:.4f} full_recall={stats['full_recall']:.0f}"
+        f"span_precision={stats['precision']:.4f} "
+        f"span_recall={stats['recall']:.4f} full_recall={stats['full_recall']:.0f}"
     )
     ax.set_xlabel("output token index")
     ax.legend()
@@ -523,7 +525,13 @@ def evaluate(model, tokenizer, args):
     window_size = int(detector["window_size"])
     aggregation = detector.get("aggregation", args.aggregation)
 
-    plots, total = [], {"tp": 0, "fp": 0, "fn": 0, "full_hits": 0}
+    plots, total = [], {
+        "detected_gold_spans": 0,
+        "missed_gold_spans": 0,
+        "correct_pred_spans": 0,
+        "false_pred_spans": 0,
+        "full_hits": 0,
+    }
     for batch in tqdm(list(batches(samples, args.batch_size)), desc="Evaluating"):
         batch_attn = get_batch_attention_weights(model, tokenizer, [sample for _, sample in batch])
         for batch_idx, (sample_id, sample) in enumerate(batch):
@@ -531,9 +539,10 @@ def evaluate(model, tokenizer, args):
             real = rolling_max(aggregate_selected_heads(sample_attn, sample, heads, aggregation), window_size)
             score = float(cosine(real, sample["ideal"]))
             stats, pred = metric_row(real, sample["ideal"], threshold)
-            total["tp"] += stats["tp"]
-            total["fp"] += stats["fp"]
-            total["fn"] += stats["fn"]
+            total["detected_gold_spans"] += stats["detected_gold_spans"]
+            total["missed_gold_spans"] += stats["missed_gold_spans"]
+            total["correct_pred_spans"] += stats["correct_pred_spans"]
+            total["false_pred_spans"] += stats["false_pred_spans"]
             total["full_hits"] += int(stats["full_recall"] == 1.0)
             if args.plot_lowest_n:
                 plots.append((score, sample_id, real, sample["ideal"], pred, stats))
@@ -543,8 +552,8 @@ def evaluate(model, tokenizer, args):
     for rank, (score, sample_id, real, ideal, pred, stats) in enumerate(sorted(plots)[: args.plot_lowest_n], 1):
         plot_sample(real, ideal, pred, score, stats, args.plot_dir / f"lowest_{rank:02d}_sample_{sample_id:04d}.png", threshold)
 
-    precision = total["tp"] / max(total["tp"] + total["fp"], 1)
-    recall = total["tp"] / max(total["tp"] + total["fn"], 1)
+    precision = total["correct_pred_spans"] / max(total["correct_pred_spans"] + total["false_pred_spans"], 1)
+    recall = total["detected_gold_spans"] / max(total["detected_gold_spans"] + total["missed_gold_spans"], 1)
     full_recall = total["full_hits"] / max(len(samples), 1)
     save_test_metrics(args, precision, recall, full_recall)
     print(f"precision={precision:.4f} recall={recall:.4f} full_recall={full_recall:.4f}")
