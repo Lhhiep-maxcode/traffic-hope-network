@@ -20,6 +20,61 @@ Generated calibration artifacts live in:
 method/calibrate_leakage_detector/output/
 ```
 
+## Create Calibration Dataset
+
+The dataset builder samples problems from Hugging Face, extracts the boxed answer, asks one or more generation models to answer with the privileged context present, then asks a judge model to mark leaked text spans.
+
+All-in-one generation plus judging:
+
+```bash
+python method/calibrate_leakage_detector/create_calibrate_dataset.py \
+  --phase all \
+  --generation-model Qwen/Qwen3-4B \
+  --judge-model Qwen/Qwen3-4B \
+  --max-examples 100 \
+  --batch-size 8 \
+  --generation-max-new-tokens 2048 \
+  --generation-temperature 0.7 \
+  --judge-max-new-tokens 1024 \
+  --output-path method/calibrate_leakage_detector/data/qwen3-4B-calibrate-dataset.jsonl \
+  --overwrite
+```
+
+This command writes:
+
+```text
+method/calibrate_leakage_detector/data/qwen3-4B-calibrate-dataset.jsonl
+```
+
+To separate generation and leakage judging, first generate responses:
+
+```bash
+python method/calibrate_leakage_detector/create_calibrate_dataset.py \
+  --phase generate \
+  --generation-model Qwen/Qwen3-4B deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --max-examples 100 \
+  --batch-size 8 \
+  --generation-max-new-tokens 2048 \
+  --generation-temperature 0.7 \
+  --output-path method/calibrate_leakage_detector/data/generated-responses.jsonl \
+  --overwrite
+```
+
+Then judge the generated responses:
+
+```bash
+python method/calibrate_leakage_detector/create_calibrate_dataset.py \
+  --phase judge \
+  --judge-model Qwen/Qwen3-4B \
+  --input-path method/calibrate_leakage_detector/data/generated-responses.jsonl \
+  --batch-size 8 \
+  --judge-max-new-tokens 1024 \
+  --output-path method/calibrate_leakage_detector/data/generated-responses-with-leakage-spans.jsonl \
+  --overwrite
+```
+
+For Qwen thinking models, add `--disable-thinking` if you want to disable thinking during generation and judging.
+
 ## Calibrate
 
 ```bash
