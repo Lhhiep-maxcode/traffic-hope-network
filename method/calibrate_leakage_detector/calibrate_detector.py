@@ -24,16 +24,18 @@ PRIVILEGED_MARKER = "Given the ground truth answer is "
 
 def parse_args():
     base = Path(__file__).parent
+    data = base / "data"
+    output = base / "output"
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", choices=["calibrate", "evaluate", "total"], default="calibrate")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--calibrate-path", type=Path, default=base / "generated-responses-with-leakage-spans.jsonl")
-    parser.add_argument("--val-calibrate-path", type=Path, default=base / "val-generated-responses-with-leakage-spans.jsonl")
-    parser.add_argument("--test-path", type=Path, default=base / "test-generated-responses-with-leakage.jsonl")
-    parser.add_argument("--detector-config-path", type=Path, default=base / "detector_config.json")
-    parser.add_argument("--score-cache-path", type=Path, default=base / "calibrate_head_scores.pt")
-    parser.add_argument("--all-experiments-path", type=Path, default=base / "all_experiments.jsonl")
-    parser.add_argument("--plot-dir", type=Path, default=base / "lowest_score_plots")
+    parser.add_argument("--calibrate-path", type=Path, default=data / "generated-responses-with-leakage-spans.jsonl")
+    parser.add_argument("--val-calibrate-path", type=Path, default=data / "val-generated-responses-with-leakage-spans.jsonl")
+    parser.add_argument("--test-path", type=Path, default=data / "test-generated-responses-with-leakage-spans.jsonl")
+    parser.add_argument("--detector-config-path", type=Path, default=output / "detector_config.json")
+    parser.add_argument("--score-cache-path", type=Path, default=output / "calibrate_head_scores.pt")
+    parser.add_argument("--all-experiments-path", type=Path, default=output / "all_experiments.jsonl")
+    parser.add_argument("--plot-dir", type=Path, default=output / "lowest_score_plots")
     parser.add_argument("--plot-lowest-n", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--top-k-values", default=None)
@@ -472,14 +474,41 @@ def calibrate(model, tokenizer, args):
     save_detector_config(heads_by_k[best["top_k"]], best, args)
 
 
-def plot_sample(real: torch.Tensor, ideal: torch.Tensor, score: float, out_path: Path, threshold: float):
+def plot_sample(
+    real: torch.Tensor,
+    ideal: torch.Tensor,
+    pred: torch.Tensor,
+    score: float,
+    stats: dict,
+    out_path: Path,
+    threshold: float,
+):
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    scale = real.max() if float(real.max()) > 0 else torch.tensor(1.0)
     fig, ax = plt.subplots(figsize=(14, 4))
     ax.plot(real.numpy(), label="detector score")
-    ax.plot((ideal * scale).numpy(), "--", drawstyle="steps-post", label="ideal leakage mask")
     ax.axhline(threshold, color="tab:red", linestyle=":", label="threshold")
-    ax.set_title(f"cosine={score:.4f}")
+
+    for i, span in enumerate(token_spans(ideal.bool())):
+        ax.axvspan(
+            span["start_token"] - 0.5,
+            span["end_token"] - 0.5,
+            color="tab:orange",
+            alpha=0.18,
+            label="gold leakage span" if i == 0 else None,
+        )
+    for i, span in enumerate(token_spans(pred.bool())):
+        ax.axvspan(
+            span["start_token"] - 0.5,
+            span["end_token"] - 0.5,
+            color="tab:blue",
+            alpha=0.08,
+            label="predicted span" if i == 0 else None,
+        )
+
+    ax.set_title(
+        f"cosine={score:.4f} "
+        f"precision={stats['precision']:.4f} recall={stats['recall']:.4f} full_recall={stats['full_recall']:.0f}"
+    )
     ax.set_xlabel("output token index")
     ax.legend()
     fig.tight_layout()
@@ -507,12 +536,12 @@ def evaluate(model, tokenizer, args):
             total["fn"] += stats["fn"]
             total["full_hits"] += int(stats["full_recall"] == 1.0)
             if args.plot_lowest_n:
-                plots.append((score, sample_id, real, sample["ideal"]))
+                plots.append((score, sample_id, real, sample["ideal"], pred, stats))
         del batch_attn
         clear_memory()
 
-    for rank, (score, sample_id, real, ideal) in enumerate(sorted(plots)[: args.plot_lowest_n], 1):
-        plot_sample(real, ideal, score, args.plot_dir / f"lowest_{rank:02d}_sample_{sample_id:04d}.png", threshold)
+    for rank, (score, sample_id, real, ideal, pred, stats) in enumerate(sorted(plots)[: args.plot_lowest_n], 1):
+        plot_sample(real, ideal, pred, score, stats, args.plot_dir / f"lowest_{rank:02d}_sample_{sample_id:04d}.png", threshold)
 
     precision = total["tp"] / max(total["tp"] + total["fp"], 1)
     recall = total["tp"] / max(total["tp"] + total["fn"], 1)

@@ -54,7 +54,7 @@ def default_output_path(args) -> Path:
     if args.phase == "judge":
         return args.input_path.with_name(f"{args.input_path.stem}-calibrate-dataset.jsonl")
     suffix = "responses" if args.phase == "generate" else "calibrate-dataset"
-    return Path(__file__).with_name(f"{model_tag(args.generation_model)}-{suffix}.jsonl")
+    return Path(__file__).with_name("data") / f"{model_tag(args.generation_model)}-{suffix}.jsonl"
 
 
 def braced_blocks(text: str, command: str) -> list[str]:
