@@ -280,6 +280,8 @@ def metric_row(real: torch.Tensor, ideal: torch.Tensor, threshold: float) -> tup
     )
     missed_gold_spans = len(gold_spans) - detected_gold_spans
     false_pred_spans = len(pred_spans) - correct_pred_spans
+    correct_pred_tokens = int((pred & gold).sum())
+    predicted_tokens = int(pred.sum())
 
     return {
         "detected_gold_spans": detected_gold_spans,
@@ -288,6 +290,8 @@ def metric_row(real: torch.Tensor, ideal: torch.Tensor, threshold: float) -> tup
         "correct_pred_spans": correct_pred_spans,
         "false_pred_spans": false_pred_spans,
         "total_pred_spans": len(pred_spans),
+        "correct_pred_tokens": correct_pred_tokens,
+        "predicted_tokens": predicted_tokens,
         "precision": correct_pred_spans / max(len(pred_spans), 1),
         "recall": detected_gold_spans / max(len(gold_spans), 1),
         "full_recall": float(detected_gold_spans == len(gold_spans)),
@@ -300,6 +304,8 @@ def pooled_metrics(records: list[dict], window_size: int, threshold: float) -> d
         "missed_gold_spans": 0,
         "correct_pred_spans": 0,
         "false_pred_spans": 0,
+        "correct_pred_tokens": 0,
+        "predicted_tokens": 0,
         "full_hits": 0,
     }
     for record in records:
@@ -308,6 +314,8 @@ def pooled_metrics(records: list[dict], window_size: int, threshold: float) -> d
         total["missed_gold_spans"] += stats["missed_gold_spans"]
         total["correct_pred_spans"] += stats["correct_pred_spans"]
         total["false_pred_spans"] += stats["false_pred_spans"]
+        total["correct_pred_tokens"] += stats["correct_pred_tokens"]
+        total["predicted_tokens"] += stats["predicted_tokens"]
         total["full_hits"] += int(stats["full_recall"] == 1.0)
     return {
         "window_size": window_size,
@@ -318,6 +326,7 @@ def pooled_metrics(records: list[dict], window_size: int, threshold: float) -> d
         "recall": total["detected_gold_spans"] / max(
             total["detected_gold_spans"] + total["missed_gold_spans"], 1
         ),
+        "token_precision": total["correct_pred_tokens"] / max(total["predicted_tokens"], 1),
         "full_recall": total["full_hits"] / max(len(records), 1),
         **total,
         "samples": len(records),
@@ -337,10 +346,20 @@ def threshold_metrics(records: list[dict], args) -> list[dict]:
 
 def choose_config(rows: list[dict]) -> dict:
     feasible = [r for r in rows if r["recall"] >= 1.0 and r["full_recall"] >= 1.0]
-    key = lambda r: (r["precision"], -r.get("top_k", 0), -r["window_size"], r["threshold"])
+    key = lambda r: (r["token_precision"], -r.get("top_k", 0), -r["window_size"], r["threshold"])
     if feasible:
         return max(feasible, key=key)
-    return max(rows, key=lambda r: (r["full_recall"], r["recall"], r["precision"], -r.get("top_k", 0), -r["window_size"], r["threshold"]))
+    return max(
+        rows,
+        key=lambda r: (
+            r["full_recall"],
+            r["recall"],
+            r["token_precision"],
+            -r.get("top_k", 0),
+            -r["window_size"],
+            r["threshold"],
+        ),
+    )
 
 
 def clear_memory():
@@ -425,6 +444,7 @@ def save_detector_config(heads: list[dict], best: dict, args):
         "val_calibration_precision": best["precision"],
         "val_calibration_recall": best["recall"],
         "val_calibration_full_recall": best["full_recall"],
+        "val_selection_token_precision": best["token_precision"],
         "test_precision": None,
         "test_recall": None,
         "test_full_recall": None,
@@ -432,7 +452,8 @@ def save_detector_config(heads: list[dict], best: dict, args):
     write_json(config, args.detector_config_path)
     print(
         f"top_k={best['top_k']} threshold={best['threshold']:.6g} window={best['window_size']} "
-        f"precision={best['precision']:.4f} recall={best['recall']:.4f}"
+        f"span_precision={best['precision']:.4f} token_precision={best['token_precision']:.4f} "
+        f"recall={best['recall']:.4f}"
     )
 
 

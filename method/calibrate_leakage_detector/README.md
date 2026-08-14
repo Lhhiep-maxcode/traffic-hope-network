@@ -1,6 +1,6 @@
 # Leakage Attention Detector
 
-This script calibrates attention heads, calibrates a token threshold/window, and evaluates the final detector.
+This script calibrates attention heads, calibrates a span-start threshold/window, and evaluates the final detector.
 
 Input rows should contain:
 
@@ -49,7 +49,7 @@ cosine(positive_median_normalized_attention, ideal_mask) * positive_contrast
 
 The final detector aggregates selected heads by normalizing each head first, then using the calibrated head scores as weights.
 
-When `--top-k-values` is provided, the script calibrates each candidate `k`, then chooses the detector with recall/full-recall equal to `1.0`, highest precision, smallest `k`, smallest window, and highest threshold. `output/all_experiments.jsonl` contains every tested `(model, top_k, window_size, threshold)` row.
+When `--top-k-values` is provided, the script calibrates each candidate `k`, then chooses the detector with span-start recall/full-recall equal to `1.0`, highest token precision, highest span precision, smallest `k`, smallest window, and highest threshold. `output/all_experiments.jsonl` contains every tested `(model, top_k, window_size, threshold)` row.
 
 ## Evaluate
 
