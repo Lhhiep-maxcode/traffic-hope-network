@@ -297,7 +297,7 @@ async def async_main():
         raise FileExistsError(f"{output_path} exists. Use --overwrite to replace it.")
 
     if args.phase == "generate":
-        write_jsonl(await generate_rows(args), output_path)
+        write_jsonl(await generate_rows(args), output_path, args.overwrite)
     elif args.phase == "judge":
         await judge_rows(args, read_jsonl(args.input_path), output_path)
     else:
