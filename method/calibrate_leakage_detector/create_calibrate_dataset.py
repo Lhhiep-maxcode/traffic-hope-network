@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import re
 from pathlib import Path
 
 from prompt import SYSTEM_PROMPT, USER_PROMPT
 from tqdm import tqdm
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.utils import read_jsonl, write_jsonl
 
 
-LEAKAGE_INSTRUCTION = (
-    "Notice that do not leak the ground truth answer in your reasoning and final answer"
-)
+
+LEAKAGE_INSTRUCTION = "Notice that do not leak the ground truth answer/solution in your reasoning and final answer"
 
 
 def parse_args():
@@ -25,13 +32,17 @@ def parse_args():
     parser.add_argument("--split", default="test")
     parser.add_argument("--problem-field", default="problem")
     parser.add_argument("--solution-field", default="solution")
+    parser.add_argument("--splitter", default=None)
     parser.add_argument("--answer-field", default="answer")
     parser.add_argument("--max-examples", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--max-concurrency", type=int, default=8)
     parser.add_argument("--output-path", type=Path, default=None)
-    parser.add_argument("--device-map", default="auto")
-    parser.add_argument("--dtype", default="float16", choices=["auto", "float32", "float16", "bfloat16"])
-    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--base-url", default="http://localhost:8000/v1")
+    parser.add_argument("--generation-base-url", default=None)
+    parser.add_argument("--judge-base-url", default=None)
+    parser.add_argument("--api-key", default="EMPTY")
+    parser.add_argument("--generation-api-key", default=None)
+    parser.add_argument("--judge-api-key", default=None)
     parser.add_argument("--disable-thinking", action="store_true")
     parser.add_argument("--generation-max-new-tokens", type=int, default=1024)
     parser.add_argument("--generation-temperature", type=float, default=0.7)
@@ -66,8 +77,7 @@ def braced_blocks(text: str, command: str) -> list[str]:
         if pos >= len(text) or text[pos] != "{":
             continue
 
-        depth = 0
-        chars = []
+        depth, chars = 0, []
         for char in text[pos + 1 :]:
             if char == "{" and (not chars or chars[-1] != "\\"):
                 depth += 1
@@ -80,14 +90,14 @@ def braced_blocks(text: str, command: str) -> list[str]:
     return blocks
 
 
-def boxed_answer(example: dict, solution_field: str, answer_field: str) -> str | None:
-    answer = example.get(answer_field, None)
+def parse_answer(example: dict, solution_field: str, answer_field: str, splitter: str) -> str | None:
+    answer = example.get(answer_field)
     if answer is not None:
         return str(answer).strip()
+    if splitter and splitter in example.get(solution_field, ""):
+        return str(example[solution_field]).split(splitter)[-1].strip()
     boxes = braced_blocks(str(example.get(solution_field, "")), r"\boxed")
-    if boxes:
-        return boxes[-1]
-    return None
+    return boxes[-1] if boxes else None
 
 
 def load_seed_examples(args) -> list[dict]:
@@ -100,7 +110,7 @@ def load_seed_examples(args) -> list[dict]:
 
     seeds = []
     for example in dataset:
-        answer = boxed_answer(example, args.solution_field, args.answer_field)
+        answer = parse_answer(example, args.solution_field, args.answer_field, args.splitter)
         problem = example.get(args.problem_field)
         if problem and answer:
             seeds.append({"problem": str(problem), "answer": answer})
@@ -109,87 +119,11 @@ def load_seed_examples(args) -> list[dict]:
     return seeds
 
 
-def build_prompt(problem: str, answer: str) -> str:
-    return (
-        f"{problem} Given the ground truth answer is $\\boxed{{{answer}}}$. "
-        f"{LEAKAGE_INSTRUCTION}"
-    )
-
-
-def torch_dtype(name: str):
-    if name == "auto":
-        return "auto"
-    import torch
-
+def build_prompt(problem: str, answer: str) -> dict:
     return {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }[name]
-
-
-def load_lm(model_name: str, args):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=args.trust_remote_code)
-    kwargs = {"torch_dtype": torch_dtype(args.dtype), "trust_remote_code": args.trust_remote_code}
-    if args.device_map != "none":
-        kwargs["device_map"] = args.device_map
-
-    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs).eval()
-    if args.device_map == "none":
-        import torch
-
-        model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return model, tokenizer
-
-
-def device_of(model):
-    return model.device if hasattr(model, "device") else next(model.parameters()).device
-
-
-def chat_text(tokenizer, user_prompt: str, system_prompt: str | None = None, enable_thinking: bool | None = None) -> str:
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": user_prompt})
-
-    kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if enable_thinking is not None:
-        kwargs["enable_thinking"] = enable_thinking
-    try:
-        return tokenizer.apply_chat_template(messages, **kwargs)
-    except TypeError:
-        kwargs.pop("enable_thinking", None)
-        return tokenizer.apply_chat_template(messages, **kwargs)
-
-
-def generate_batch(model, tokenizer, prompts: list[str], max_new_tokens: int, temperature: float, enable_thinking: bool | None = None, system_prompt: str | None = None) -> list[str]:
-    import torch
-
-    texts = [chat_text(tokenizer, prompt, system_prompt, enable_thinking) for prompt in prompts]
-    old_padding_side = tokenizer.padding_side
-    try:
-        tokenizer.padding_side = "left"
-        inputs = tokenizer(texts, return_tensors="pt", padding=True).to(device_of(model))
-    finally:
-        tokenizer.padding_side = old_padding_side
-
-    kwargs = {"max_new_tokens": max_new_tokens, "pad_token_id": tokenizer.pad_token_id}
-    kwargs["do_sample"] = temperature > 0
-    if temperature > 0:
-        kwargs["temperature"] = temperature
-
-    with torch.inference_mode():
-        output_ids = model.generate(**inputs, **kwargs)
-
-    input_len = inputs["input_ids"].shape[1]
-    return [
-        tokenizer.decode(ids[input_len:], skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
-        for ids in output_ids
-    ]
+        'prompt': f"{problem} \nGiven the ground truth answer/solution is $\\boxed{{{answer}}}$. {LEAKAGE_INSTRUCTION}",
+        'privileged_context': f"\nGiven the ground truth answer/solution is $\\boxed{{{answer}}}$. {LEAKAGE_INSTRUCTION}"
+    }
 
 
 def leakage_spans(judge_output: str, response: str) -> list[str]:
@@ -201,97 +135,145 @@ def leakage_spans(judge_output: str, response: str) -> list[str]:
     return spans
 
 
-def write_jsonl(rows: list[dict], path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
-        for row in rows:
-            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+def openai_client(base_url: str, api_key: str):
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as exc:
+        raise ImportError("Install the OpenAI Python package first: pip install openai") from exc
+    return AsyncOpenAI(base_url=base_url, api_key=api_key)
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    with path.open("r", encoding="utf-8") as file:
-        return [json.loads(line) for line in file if line.strip()]
+def thinking_extra_body(enable_thinking: bool | None):
+    if enable_thinking is False:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return None
 
 
-def clear_model_memory():
-    import gc
-    import torch
-
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+async def close_client(client):
+    result = client.close()
+    if asyncio.iscoroutine(result):
+        await result
 
 
-def generate_rows(args) -> list[dict]:
+async def complete(
+    client,
+    model: str,
+    user_prompt: str,
+    max_tokens: int,
+    temperature: float,
+    system_prompt: str | None = None,
+    enable_thinking: bool | None = None,
+) -> str:
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    extra_body = thinking_extra_body(enable_thinking)
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+
+    response = await client.chat.completions.create(**kwargs)
+    return (response.choices[0].message.content or "").strip()
+
+
+async def limited_map(items: list, fn, max_concurrency: int, desc: str) -> list:
+    semaphore = asyncio.Semaphore(max_concurrency)
+    results = [None] * len(items)
+
+    async def run(i, item):
+        async with semaphore:
+            results[i] = await fn(item)
+
+    tasks = [asyncio.create_task(run(i, item)) for i, item in enumerate(items)]
+    for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=desc):
+        await task
+    return results
+
+
+async def generate_rows(args) -> list[dict]:
     seeds = load_seed_examples(args)
     print(f"Loaded {len(seeds)} seed examples from {args.dataset}/{args.split}")
 
+    base_url = args.generation_base_url or args.base_url
+    api_key = args.generation_api_key or args.api_key
+    client = openai_client(base_url, api_key)
     rows = []
-    for model_name in args.generation_model:
-        print(f"Loading generation model: {model_name}")
-        model, tokenizer = load_lm(model_name, args)
 
-        batches = range(0, len(seeds), args.batch_size)
-        for start in tqdm(batches, desc=f"Generating {model_slug(model_name)}", unit="batch"):
-            batch = seeds[start : start + args.batch_size]
-            prompts = [build_prompt(seed["problem"], seed["answer"]) for seed in batch]
-            responses = generate_batch(
-                model,
-                tokenizer,
-                prompts,
-                args.generation_max_new_tokens,
-                args.generation_temperature,
-                enable_thinking=None if not args.disable_thinking else False,
-            )
+    try:
+        for model_name in args.generation_model:
+            prompts = [build_prompt(seed["problem"], seed["answer"]) for seed in seeds]
+
+            async def generate_one(prompt: dict):
+                response = await complete(
+                    client,
+                    model_name,
+                    prompt["prompt"],
+                    args.generation_max_new_tokens,
+                    args.generation_temperature,
+                    enable_thinking=None if not args.disable_thinking else False,
+                )
+                return {
+                    "generation_model": model_name, 
+                    "prompt": prompt["prompt"], 
+                    "privileged_context": prompt["privileged_context"], 
+                    "response": response
+                }
+
             rows.extend(
-                {"generation_model": model_name, "prompt": prompt, "response": response}
-                for prompt, response in zip(prompts, responses)
+                await limited_map(
+                    prompts,
+                    generate_one,
+                    args.max_concurrency,
+                    desc=f"Generating {model_slug(model_name)}",
+                )
             )
-        del model, tokenizer
-        clear_model_memory()
+    finally:
+        await close_client(client)
     return rows
 
 
-def judge_rows(args, rows: list[dict], output_path: Path):
-    print(f"Loading judge model: {args.judge_model}")
-    judge, tokenizer = load_lm(args.judge_model, args)
+async def judge_rows(args, rows: list[dict], output_path: Path):
+    base_url = args.judge_base_url or args.base_url
+    api_key = args.judge_api_key or args.api_key
+    client = openai_client(base_url, api_key)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as file:
-        batches = range(0, len(rows), args.batch_size)
-        for start in tqdm(batches, desc="Detecting leakage", unit="batch"):
-            batch = rows[start : start + args.batch_size]
-            judge_prompts = [
-                USER_PROMPT.format(prompt=row["prompt"], response=row["response"])
-                for row in batch
-            ]
-            judge_outputs = generate_batch(
-                judge,
-                tokenizer,
-                judge_prompts,
-                args.judge_max_new_tokens,
-                temperature=0.0,
-                enable_thinking=False,
-                system_prompt=SYSTEM_PROMPT,
-            )
-            for row, judge_output in zip(batch, judge_outputs):
-                file.write(
-                    json.dumps(
-                        {
-                            "prompt": row["prompt"],
-                            "response": row["response"],
-                            "leakage_spans": leakage_spans(judge_output, row["response"]),
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+    async def judge_one(row: dict):
+        judge_prompt = USER_PROMPT.format(prompt=row["prompt"], response=row["response"])
+        judge_output = await complete(
+            client,
+            args.judge_model,
+            judge_prompt,
+            args.judge_max_new_tokens,
+            temperature=0.0,
+            system_prompt=SYSTEM_PROMPT,
+            enable_thinking=False,
+        )
+        return {
+            "generation_model": row["generation_model"],
+            "prompt": row["prompt"],
+            "response": row["response"],
+            "privileged_context": row["privileged_context"],
+            "leakage_spans": leakage_spans(judge_output, row["response"]),
+        }
+
+    try:
+        judged_rows = await limited_map(rows, judge_one, args.max_concurrency, desc="Detecting leakage")
+    finally:
+        await close_client(client)
+    write_jsonl(judged_rows, output_path)
 
 
-def main():
+async def async_main():
     args = parse_args()
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be >= 1")
+    if args.max_concurrency < 1:
+        raise ValueError("--max-concurrency must be >= 1")
     if args.phase in {"generate", "all"} and not args.generation_model:
         raise ValueError("--generation-model is required for --phase generate/all")
     if args.phase == "judge" and args.input_path is None:
@@ -306,13 +288,17 @@ def main():
         raise FileExistsError(f"{output_path} exists. Use --overwrite to replace it.")
 
     if args.phase == "generate":
-        write_jsonl(generate_rows(args), output_path)
+        write_jsonl(await generate_rows(args), output_path)
     elif args.phase == "judge":
-        judge_rows(args, read_jsonl(args.input_path), output_path)
+        await judge_rows(args, read_jsonl(args.input_path), output_path)
     else:
-        judge_rows(args, generate_rows(args), output_path)
+        await judge_rows(args, await generate_rows(args), output_path)
 
     print(f"Saved {output_path}")
+
+
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":

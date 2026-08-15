@@ -41,6 +41,7 @@ def parse_args():
     parser.add_argument("--top-k-values", default=None)
     parser.add_argument("--window-sizes", default="1,3,5,7")
     parser.add_argument("--threshold-steps", type=int, default=80)
+    parser.add_argument("--span-penalty-alpha", type=float, default=0.01)
     parser.add_argument("--aggregation", choices=["weighted", "mean"], default="weighted")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -327,6 +328,8 @@ def pooled_metrics(records: list[dict], window_size: int, threshold: float) -> d
             total["detected_gold_spans"] + total["missed_gold_spans"], 1
         ),
         "token_precision": total["correct_pred_tokens"] / max(total["predicted_tokens"], 1),
+        "total_pred_spans": total["correct_pred_spans"] + total["false_pred_spans"],
+        "avg_pred_spans_per_sample": (total["correct_pred_spans"] + total["false_pred_spans"]) / max(len(records), 1),
         "full_recall": total["full_hits"] / max(len(records), 1),
         **total,
         "samples": len(records),
@@ -344,9 +347,12 @@ def threshold_metrics(records: list[dict], args) -> list[dict]:
     return rows
 
 
-def choose_config(rows: list[dict]) -> dict:
+def choose_config(rows: list[dict], args) -> dict:
     feasible = [r for r in rows if r["recall"] >= 1.0 and r["full_recall"] >= 1.0]
-    key = lambda r: (r["token_precision"], -r.get("top_k", 0), -r["window_size"], r["threshold"])
+    key = lambda r: (
+        r["token_precision"] - args.span_penalty_alpha * r["avg_pred_spans_per_sample"],
+        -r.get("top_k", 0), -r["window_size"], r["threshold"]
+    )
     if feasible:
         return max(feasible, key=key)
     return max(
@@ -354,7 +360,7 @@ def choose_config(rows: list[dict]) -> dict:
         key=lambda r: (
             r["full_recall"],
             r["recall"],
-            r["token_precision"],
+            r["token_precision"] - args.span_penalty_alpha * r["avg_pred_spans_per_sample"],
             -r.get("top_k", 0),
             -r["window_size"],
             r["threshold"],
@@ -445,6 +451,8 @@ def save_detector_config(heads: list[dict], best: dict, args):
         "val_calibration_recall": best["recall"],
         "val_calibration_full_recall": best["full_recall"],
         "val_selection_token_precision": best["token_precision"],
+        "val_avg_pred_spans_per_sample": best["avg_pred_spans_per_sample"],
+        "span_penalty_alpha": args.span_penalty_alpha,
         "test_precision": None,
         "test_recall": None,
         "test_full_recall": None,
@@ -453,6 +461,7 @@ def save_detector_config(heads: list[dict], best: dict, args):
     print(
         f"top_k={best['top_k']} threshold={best['threshold']:.6g} window={best['window_size']} "
         f"span_precision={best['precision']:.4f} token_precision={best['token_precision']:.4f} "
+        f"avg_pred_spans={best['avg_pred_spans_per_sample']:.2f} "
         f"recall={best['recall']:.4f}"
     )
 
@@ -490,7 +499,7 @@ def calibrate(model, tokenizer, args):
         rows = [{**row, "model": key, "top_k": k} for row in threshold_metrics(records_by_k[k], args)]
         all_metrics.extend(rows)
 
-    best = choose_config(all_metrics)
+    best = choose_config(all_metrics, args)
     best["top_k_values"] = top_ks
     write_jsonl(all_metrics, args.all_experiments_path, args.overwrite)
     save_detector_config(heads_by_k[best["top_k"]], best, args)

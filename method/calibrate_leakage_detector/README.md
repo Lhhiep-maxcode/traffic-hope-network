@@ -22,7 +22,22 @@ method/calibrate_leakage_detector/output/
 
 ## Create Calibration Dataset
 
-The dataset builder samples problems from Hugging Face, extracts the boxed answer, asks one or more generation models to answer with the privileged context present, then asks a judge model to mark leaked text spans.
+The dataset builder samples problems from Hugging Face, extracts the boxed answer, asks one or more generation models through a vLLM OpenAI-compatible server, then asks a judge model to mark leaked text spans.
+
+Start a vLLM OpenAI-compatible server separately, for example:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen3-4B \
+  --served-model-name Qwen/Qwen3-4B \
+  --port 8000
+```
+
+The script uses the OpenAI Python client:
+
+```bash
+pip install openai
+```
 
 All-in-one generation plus judging:
 
@@ -31,8 +46,9 @@ python method/calibrate_leakage_detector/create_calibrate_dataset.py \
   --phase all \
   --generation-model Qwen/Qwen3-4B \
   --judge-model Qwen/Qwen3-4B \
+  --base-url http://localhost:8000/v1 \
   --max-examples 100 \
-  --batch-size 8 \
+  --max-concurrency 8 \
   --generation-max-new-tokens 2048 \
   --generation-temperature 0.7 \
   --judge-max-new-tokens 1024 \
@@ -52,8 +68,9 @@ To separate generation and leakage judging, first generate responses:
 python method/calibrate_leakage_detector/create_calibrate_dataset.py \
   --phase generate \
   --generation-model Qwen/Qwen3-4B deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --base-url http://localhost:8000/v1 \
   --max-examples 100 \
-  --batch-size 8 \
+  --max-concurrency 8 \
   --generation-max-new-tokens 2048 \
   --generation-temperature 0.7 \
   --output-path method/calibrate_leakage_detector/data/generated-responses.jsonl \
@@ -66,14 +83,17 @@ Then judge the generated responses:
 python method/calibrate_leakage_detector/create_calibrate_dataset.py \
   --phase judge \
   --judge-model Qwen/Qwen3-4B \
+  --base-url http://localhost:8000/v1 \
   --input-path method/calibrate_leakage_detector/data/generated-responses.jsonl \
-  --batch-size 8 \
+  --max-concurrency 8 \
   --judge-max-new-tokens 1024 \
   --output-path method/calibrate_leakage_detector/data/generated-responses-with-leakage-spans.jsonl \
   --overwrite
 ```
 
-For Qwen thinking models, add `--disable-thinking` if you want to disable thinking during generation and judging.
+If the generation and judge models are served by different vLLM servers, use `--generation-base-url` and `--judge-base-url`.
+
+The model names passed to `--generation-model` and `--judge-model` must match the model names served by vLLM. For Qwen thinking models, add `--disable-thinking` if you also want to disable thinking during response generation; leakage judging disables thinking by default.
 
 ## Calibrate
 
@@ -85,6 +105,7 @@ python method/calibrate_leakage_detector/calibrate_detector.py \
   --batch-size 2 \
   --window-sizes 1,3,5,7 \
   --threshold-steps 80 \
+  --span-penalty-alpha 0.01 \
   --overwrite
 ```
 
@@ -104,7 +125,7 @@ cosine(positive_median_normalized_attention, ideal_mask) * positive_contrast
 
 The final detector aggregates selected heads by normalizing each head first, then using the calibrated head scores as weights.
 
-When `--top-k-values` is provided, the script calibrates each candidate `k`, then chooses the detector with span-start recall/full-recall equal to `1.0`, highest token precision, highest span precision, smallest `k`, smallest window, and highest threshold. `output/all_experiments.jsonl` contains every tested `(model, top_k, window_size, threshold)` row.
+When `--top-k-values` is provided, the script calibrates each candidate `k`, then chooses the detector with span-start recall/full-recall equal to `1.0`, highest `token_precision - alpha * avg_pred_spans_per_sample`, highest token precision, highest span precision, smallest `k`, smallest window, and highest threshold. `output/all_experiments.jsonl` contains every tested `(model, top_k, window_size, threshold)` row.
 
 ## Evaluate
 
