@@ -180,7 +180,16 @@ async def complete(
         kwargs["extra_body"] = extra_body
 
     response = await client.chat.completions.create(**kwargs)
-    return (response.choices[0].message.content or "").strip()
+    message = response.choices[0].message
+
+    reasoning = (
+        getattr(message, "reasoning", None)
+        or getattr(message, "reasoning_content", None)
+        or ""
+    )
+    content = message.content or ""
+
+    return (reasoning + content).strip()
 
 
 async def limited_map(items: list, fn, max_concurrency: int, desc: str) -> list:
