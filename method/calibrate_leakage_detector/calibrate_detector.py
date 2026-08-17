@@ -7,7 +7,6 @@ import re
 import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -27,16 +26,12 @@ def parse_args():
     data = base / "data"
     output = base / "output"
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=["calibrate", "evaluate", "total"], default="calibrate")
     parser.add_argument("--model", required=True)
     parser.add_argument("--calibrate-path", type=Path, default=data / "generated-responses-with-leakage-spans.jsonl")
     parser.add_argument("--val-calibrate-path", type=Path, default=data / "val-generated-responses-with-leakage-spans.jsonl")
-    parser.add_argument("--test-path", type=Path, default=data / "test-generated-responses-with-leakage-spans.jsonl")
     parser.add_argument("--detector-config-path", type=Path, default=output / "detector_config.json")
     parser.add_argument("--score-cache-path", type=Path, default=output / "calibrate_head_scores.pt")
     parser.add_argument("--all-experiments-path", type=Path, default=output / "all_experiments.jsonl")
-    parser.add_argument("--plot-dir", type=Path, default=output / "lowest_score_plots")
-    parser.add_argument("--plot-lowest-n", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--top-k-values", default=None)
     parser.add_argument("--window-sizes", default="1,3,5,7")
@@ -466,19 +461,6 @@ def save_detector_config(heads: list[dict], best: dict, args):
     )
 
 
-def save_test_metrics(args, precision: float, recall: float, full_recall: float):
-    key = model_name_key(args.model)
-    config = read_json(args.detector_config_path)
-    if key not in config:
-        raise KeyError(f"No detector config for {key} in {args.detector_config_path}.")
-    config[key].update({
-        "test_precision": precision,
-        "test_recall": recall,
-        "test_full_recall": full_recall,
-    })
-    write_json(config, args.detector_config_path)
-
-
 def calibrate(model, tokenizer, args):
     key = model_name_key(args.model)
     if key in read_json(args.detector_config_path) and not args.overwrite:
@@ -505,95 +487,11 @@ def calibrate(model, tokenizer, args):
     save_detector_config(heads_by_k[best["top_k"]], best, args)
 
 
-def plot_sample(
-    real: torch.Tensor,
-    ideal: torch.Tensor,
-    pred: torch.Tensor,
-    score: float,
-    stats: dict,
-    out_path: Path,
-    threshold: float,
-):
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(14, 4))
-    ax.plot(real.numpy(), label="detector score")
-    ax.axhline(threshold, color="tab:red", linestyle=":", label="threshold")
-
-    for i, span in enumerate(token_spans(ideal.bool())):
-        ax.axvspan(
-            span["start_token"] - 0.5,
-            span["end_token"] - 0.5,
-            color="tab:orange",
-            alpha=0.18,
-            label="gold leakage span" if i == 0 else None,
-        )
-    for i, span in enumerate(token_spans(pred.bool())):
-        ax.axvspan(
-            span["start_token"] - 0.5,
-            span["end_token"] - 0.5,
-            color="tab:blue",
-            alpha=0.08,
-            label="predicted span" if i == 0 else None,
-        )
-
-    ax.set_title(
-        f"cosine={score:.4f} "
-        f"span_precision={stats['precision']:.4f} "
-        f"span_recall={stats['recall']:.4f} full_recall={stats['full_recall']:.0f}"
-    )
-    ax.set_xlabel("output token index")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
-
-
-def evaluate(model, tokenizer, args):
-    detector = read_detector(args)
-    samples = [(i, s) for i, s in enumerate(build_samples(args.test_path, tokenizer, args), 1)]
-    heads, threshold = detector["heads"], float(detector["threshold"])
-    window_size = int(detector["window_size"])
-    aggregation = detector.get("aggregation", args.aggregation)
-
-    plots, total = [], {
-        "detected_gold_spans": 0,
-        "missed_gold_spans": 0,
-        "correct_pred_spans": 0,
-        "false_pred_spans": 0,
-        "full_hits": 0,
-    }
-    for batch in tqdm(list(batches(samples, args.batch_size)), desc="Evaluating"):
-        batch_attn = get_batch_attention_weights(model, tokenizer, [sample for _, sample in batch])
-        for batch_idx, (sample_id, sample) in enumerate(batch):
-            sample_attn = take_sample_attentions(batch_attn, batch_idx, len(sample["input_ids"]))
-            real = rolling_max(aggregate_selected_heads(sample_attn, sample, heads, aggregation), window_size)
-            score = float(cosine(real, sample["ideal"]))
-            stats, pred = metric_row(real, sample["ideal"], threshold)
-            total["detected_gold_spans"] += stats["detected_gold_spans"]
-            total["missed_gold_spans"] += stats["missed_gold_spans"]
-            total["correct_pred_spans"] += stats["correct_pred_spans"]
-            total["false_pred_spans"] += stats["false_pred_spans"]
-            total["full_hits"] += int(stats["full_recall"] == 1.0)
-            if args.plot_lowest_n:
-                plots.append((score, sample_id, real, sample["ideal"], pred, stats))
-        del batch_attn
-        clear_memory()
-
-    for rank, (score, sample_id, real, ideal, pred, stats) in enumerate(sorted(plots)[: args.plot_lowest_n], 1):
-        plot_sample(real, ideal, pred, score, stats, args.plot_dir / f"lowest_{rank:02d}_sample_{sample_id:04d}.png", threshold)
-
-    precision = total["correct_pred_spans"] / max(total["correct_pred_spans"] + total["false_pred_spans"], 1)
-    recall = total["detected_gold_spans"] / max(total["detected_gold_spans"] + total["missed_gold_spans"], 1)
-    full_recall = total["full_hits"] / max(len(samples), 1)
-    save_test_metrics(args, precision, recall, full_recall)
-    print(f"precision={precision:.4f} recall={recall:.4f} full_recall={full_recall:.4f}")
-
-
 def main():
     args = parse_args()
     if args.batch_size < 1 or args.threshold_steps < 1:
         raise ValueError("--batch-size and --threshold-steps must be positive.")
-    for path in (args.score_cache_path, args.all_experiments_path):
+    for path in (args.score_cache_path, args.all_experiments_path, args.detector_config_path):
         path.parent.mkdir(parents=True, exist_ok=True)
 
     model, tokenizer = load_model_and_tokenizer(
@@ -603,10 +501,7 @@ def main():
         dtype=torch_dtype(args.dtype),
         trust_remote_code=args.trust_remote_code,
     )
-    if args.phase in {"calibrate", "total"}:
-        calibrate(model, tokenizer, args)
-    if args.phase in {"evaluate", "total"}:
-        evaluate(model, tokenizer, args)
+    calibrate(model, tokenizer, args)
 
 
 if __name__ == "__main__":
