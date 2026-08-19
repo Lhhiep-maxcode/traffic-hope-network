@@ -10,6 +10,7 @@ def parse_args():
     parser.add_argument("--output-html", type=Path, default=base / "precision_recall_frontier.html")
     parser.add_argument("--output-png", type=Path, default=base / "precision_recall_frontier.png")
     parser.add_argument("--model", default=None, help="Optional model key filter.")
+    parser.add_argument("--lowest-full-recall", type=float, default=None, help="Optional filter for lowest full recall to include.")
     return parser.parse_args()
 
 
@@ -22,12 +23,14 @@ def experiment_name(path: Path) -> str:
     return path.parent.name if path.parent.name != "output" else path.stem
 
 
-def read_experiments(paths: list[Path], model: str | None = None) -> dict[str, list[dict]]:
+def read_experiments(paths: list[Path], model: str | None = None, lowest_full_recall: float | None = None) -> dict[str, list[dict]]:
     experiments = {}
     for path in paths:
         rows = read_jsonl(path)
         if model:
             rows = [row for row in rows if row.get("model") == model]
+        if lowest_full_recall is not None:
+            rows = [row for row in rows if row.get("full_recall", 0) >= lowest_full_recall]
         rows = [row for row in rows if "precision" in row and "recall" in row]
         if rows:
             name = experiment_name(path)
@@ -150,7 +153,7 @@ def plot_png(experiments: dict[str, list[dict]], path: Path):
 
 def main():
     args = parse_args()
-    experiments = read_experiments(args.input_path, args.model)
+    experiments = read_experiments(args.input_path, args.model, lowest_full_recall=args.lowest_full_recall)
     if not experiments:
         raise ValueError("No experiment rows with precision/recall were found.")
 

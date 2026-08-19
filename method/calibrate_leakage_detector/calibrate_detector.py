@@ -343,10 +343,9 @@ def threshold_metrics(records: list[dict], args) -> list[dict]:
 
 
 def choose_config(rows: list[dict], args) -> dict:
-    feasible = [r for r in rows if r["recall"] >= 1.0 and r["full_recall"] >= 1.0]
+    feasible = [r for r in rows if r["full_recall"] >= 0.8 and r['threshold'] > 0]
     key = lambda r: (
-        r["token_precision"] - args.span_penalty_alpha * r["avg_pred_spans_per_sample"],
-        -r.get("top_k", 0), -r["window_size"], r["threshold"]
+        r["precision"], -r.get("top_k", 0), -r["window_size"], r["threshold"]
     )
     if feasible:
         return max(feasible, key=key)
@@ -354,8 +353,7 @@ def choose_config(rows: list[dict], args) -> dict:
         rows,
         key=lambda r: (
             r["full_recall"],
-            r["recall"],
-            r["token_precision"] - args.span_penalty_alpha * r["avg_pred_spans_per_sample"],
+            r["precision"],
             -r.get("top_k", 0),
             -r["window_size"],
             r["threshold"],
