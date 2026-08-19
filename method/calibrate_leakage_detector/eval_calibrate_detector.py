@@ -51,7 +51,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def save_test_metrics(args, precision: float, recall: float, full_recall: float):
+def save_test_metrics(args, precision: float, recall: float, full_recall: float, token_precision: float, avg_pred_spans: float):
     key = model_name_key(args.model)
     config = read_json(args.detector_config_path)
     if key not in config:
@@ -60,6 +60,8 @@ def save_test_metrics(args, precision: float, recall: float, full_recall: float)
         "test_precision": precision,
         "test_recall": recall,
         "test_full_recall": full_recall,
+        "test_token_precision": token_precision,
+        "test_avg_pred_spans": avg_pred_spans,
     })
     write_json(config, args.detector_config_path)
 
@@ -144,8 +146,10 @@ def evaluate(model, tokenizer, args):
     precision = total["correct_pred_spans"] / max(total["correct_pred_spans"] + total["false_pred_spans"], 1)
     recall = total["detected_gold_spans"] / max(total["detected_gold_spans"] + total["missed_gold_spans"], 1)
     full_recall = total["full_hits"] / max(len(samples), 1)
-    save_test_metrics(args, precision, recall, full_recall)
-    print(f"precision={precision:.4f} recall={recall:.4f} full_recall={full_recall:.4f}")
+    avg_pred_spans = (total["correct_pred_spans"] + total["false_pred_spans"]) / max(len(samples), 1)
+    token_precision = total['correct_pred_tokens'] / total['predicted_tokens'] if total['predicted_tokens'] > 0 else 0.0
+    save_test_metrics(args, precision, recall, full_recall, token_precision, avg_pred_spans)
+    print(f"precision={precision:.4f} recall={recall:.4f} full_recall={full_recall:.4f} avg_pred_spans={avg_pred_spans:.4f} token_precision={token_precision:.4f}")
 
 
 def main():
