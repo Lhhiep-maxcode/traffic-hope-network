@@ -35,6 +35,7 @@ def parse_args():
     output = base / "output"
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
+    parser.add_argument("--model-key")
     parser.add_argument("--test-path", type=Path, default=data / "test-generated-responses-with-leakage-spans.jsonl")
     parser.add_argument("--detector-config-path", type=Path, default=output / "detector_config.json")
     parser.add_argument("--plot-dir", type=Path, default=output / "lowest_score_plots")
@@ -52,7 +53,10 @@ def parse_args():
 
 
 def save_test_metrics(args, precision: float, recall: float, full_recall: float, token_precision: float, avg_pred_spans: float):
-    key = model_name_key(args.model)
+    if args.model_key:
+        key = args.model_key
+    else:
+        key = model_name_key(args.model)
     config = read_json(args.detector_config_path)
     if key not in config:
         raise KeyError(f"No detector config for {key} in {args.detector_config_path}.")

@@ -27,6 +27,7 @@ def parse_args():
     output = base / "output"
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
+    parser.add_argument("--model-key")
     parser.add_argument("--calibrate-path", type=Path, default=data / "generated-responses-with-leakage-spans.jsonl")
     parser.add_argument("--val-calibrate-path", type=Path, default=data / "val-generated-responses-with-leakage-spans.jsonl")
     parser.add_argument("--detector-config-path", type=Path, default=output / "detector_config.json")
@@ -57,7 +58,10 @@ def model_name_key(model: str) -> str:
 
 
 def read_detector(args) -> dict:
-    key = model_name_key(args.model)
+    if args.model_key:
+        key = args.model_key
+    else:
+        key = model_name_key(args.model)
     config = read_json(args.detector_config_path)
     if key not in config:
         raise KeyError(f"No detector config for {key} in {args.detector_config_path}.")
