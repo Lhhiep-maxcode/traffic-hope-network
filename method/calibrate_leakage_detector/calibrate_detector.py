@@ -346,18 +346,30 @@ def threshold_metrics(records: list[dict], args) -> list[dict]:
     return rows
 
 
+def harmonic_mean(a: float, b: float) -> float:
+    return 2 * a * b / max(a + b, EPS)
+
+
+def best_config_criteria(row: dict) -> tuple:
+    aug_precision = harmonic_mean(row["precision"], row["token_precision"])
+    score = harmonic_mean(aug_precision, row["recall"])
+    return (
+        score,
+        -row.get("top_k", 0),
+        -row["window_size"],
+        row["threshold"],
+    )
+
+
 def choose_config(rows: list[dict], args) -> dict:
     feasible = [r for r in rows if r["full_recall"] >= 0.8 and r['threshold'] > 0]
-    key = lambda r: (
-        r["precision"], -r.get("top_k", 0), -r["window_size"], r["threshold"]
-    )
     if feasible:
-        return max(feasible, key=key)
+        return max(feasible, key=best_config_criteria)
     return max(
         rows,
         key=lambda r: (
             r["full_recall"],
-            r["precision"],
+            best_config_criteria(r)[0],
             -r.get("top_k", 0),
             -r["window_size"],
             r["threshold"],
