@@ -56,7 +56,7 @@ def save_test_metrics(args, precision: float, recall: float, full_recall: float,
     if args.model_key:
         key = args.model_key
     else:
-        key = model_name_key(args.model)
+        key = model_name_key(args)
     config = read_json(args.detector_config_path)
     if key not in config:
         raise KeyError(f"No detector config for {key} in {args.detector_config_path}.")

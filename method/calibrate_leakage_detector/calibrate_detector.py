@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import torch
+import warnings
 import torch.nn.functional as F
 from tqdm import tqdm
 
@@ -51,8 +52,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def model_name_key(model: str) -> str:
-    name = re.split(r"[\\/]", model.rstrip("\\/"))[-1]
+def model_name_key(args) -> str:
+    if args.model_key:
+        return args.model_key
+    name = re.split(r"[\\/]", args.model.rstrip("\\/"))[-1]
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-")
 
 
@@ -60,7 +63,7 @@ def read_detector(args) -> dict:
     if args.model_key:
         key = args.model_key
     else:
-        key = model_name_key(args.model)
+        key = model_name_key(args)
     config = read_json(args.detector_config_path)
     if key not in config:
         raise KeyError(f"No detector config for {key} in {args.detector_config_path}.")
@@ -412,14 +415,17 @@ def calibrate_head_scores(model, tokenizer, samples: list[dict], args) -> torch.
         clear_memory()
 
     scores = total / used
-    torch.save({"model": model_name_key(args.model), "scores": scores.cpu(), "used": used}, args.score_cache_path)
+    torch.save({"model": model_name_key(args), "scores": scores.cpu(), "used": used}, args.score_cache_path)
     return scores
 
 
 def load_head_scores(args) -> torch.Tensor:
     cache = torch.load(args.score_cache_path, map_location="cpu")
-    if cache.get("model") != model_name_key(args.model):
-        raise ValueError(f"Cache is for {cache.get('model')}, but --model is {model_name_key(args.model)}.")
+    if cache.get("model") != model_name_key(args):
+        warnings.warn(
+            f"Cache is for {cache.get('model')}, but --model is {model_name_key(args)}.",
+            UserWarning,
+        )
     print(f"Loaded head scores from {args.score_cache_path}.")
     return cache["scores"]
 
@@ -445,7 +451,7 @@ def detector_records_by_k(model, tokenizer, samples: list[dict], scores: torch.T
 
 
 def save_detector_config(heads: list[dict], best: dict, args):
-    key = model_name_key(args.model)
+    key = model_name_key(args)
     config = read_json(args.detector_config_path)
 
     config[key] = {
@@ -474,7 +480,7 @@ def save_detector_config(heads: list[dict], best: dict, args):
 
 
 def calibrate(model, tokenizer, args):
-    key = model_name_key(args.model)
+    key = model_name_key(args)
     if key in read_json(args.detector_config_path) and not args.overwrite:
         print(f"Detector for {key} already exists in {args.detector_config_path}. Skipping calibration.")
         return
