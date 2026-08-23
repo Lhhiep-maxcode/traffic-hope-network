@@ -37,7 +37,6 @@ def parse_args():
     parser.add_argument("--top-k-values", default=None)
     parser.add_argument("--window-sizes", default="1,3,5,7")
     parser.add_argument("--threshold-steps", type=int, default=80)
-    parser.add_argument("--span-penalty-alpha", type=float, default=0.01)
     parser.add_argument("--aggregation", choices=["weighted", "mean"], default="weighted")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -461,7 +460,6 @@ def save_detector_config(heads: list[dict], best: dict, args):
         "val_calibration_full_recall": best["full_recall"],
         "val_selection_token_precision": best["token_precision"],
         "val_avg_pred_spans_per_sample": best["avg_pred_spans_per_sample"],
-        "span_penalty_alpha": args.span_penalty_alpha,
         "test_precision": None,
         "test_recall": None,
         "test_full_recall": None,
