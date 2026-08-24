@@ -126,6 +126,8 @@ def evaluate(model, tokenizer, args):
         "correct_pred_spans": 0,
         "false_pred_spans": 0,
         "full_hits": 0,
+        "correct_pred_tokens": 0,
+        "predicted_tokens": 0,
     }
     for batch in tqdm(list(batches(samples, args.batch_size)), desc="Evaluating"):
         batch_attn = get_batch_attention_weights(model, tokenizer, [sample for _, sample in batch])
@@ -139,6 +141,8 @@ def evaluate(model, tokenizer, args):
             total["correct_pred_spans"] += stats["correct_pred_spans"]
             total["false_pred_spans"] += stats["false_pred_spans"]
             total["full_hits"] += int(stats["full_recall"] == 1.0)
+            total["correct_pred_tokens"] += stats["correct_pred_tokens"]
+            total["predicted_tokens"] += stats["predicted_tokens"]
             if args.plot_lowest_n:
                 plots.append((score, sample_id, real, sample["ideal"], pred, stats))
         del batch_attn
