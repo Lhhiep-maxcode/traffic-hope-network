@@ -244,6 +244,44 @@ Evaluation updates these fields inside the detector config for the chosen model:
 }
 ```
 
+## Rule-Based Baseline
+
+Use this to compare the attention detector against a calibration-derived rule detector. The baseline learns text patterns from `leakage_spans` in the model's calibration data, then applies those learned patterns to the test responses. It does not load the model; it only loads the tokenizer so predicted text spans and gold leakage spans can be mapped to tokens consistently.
+
+```bash
+python method/calibrate_leakage_detector/eval_rule_based_detector.py \
+  --model Qwen/Qwen3-4B \
+  --calibrate-path method/calibrate_leakage_detector/data/Qwen3-4B/generated-responses_Qwen3-4B_with-leakage-spans.jsonl \
+  --input-path method/calibrate_leakage_detector/data/Qwen3-4B/test_generated-responses_Qwen3-4B_with-leakage-spans.jsonl \
+  --output-path method/calibrate_leakage_detector/output/Qwen3-4B/rule_based_metrics.json \
+  --rules-output-path method/calibrate_leakage_detector/output/Qwen3-4B/rule_based_rules.json \
+  --predictions-path method/calibrate_leakage_detector/output/Qwen3-4B/rule_based_predictions.jsonl \
+  --trust-remote-code
+```
+
+The script prints and saves these five main metrics:
+
+| Span precision | Span recall | Full recall | Token precision | Avg pred spans |
+| :------------: | :---------: | :---------: | :-------------: | :------------: |
+
+Rule-baseline parameters:
+
+- `--model`: Required tokenizer id or local tokenizer path. Use the same model tokenizer as the attention detector.
+- `--calibrate-path`: JSONL calibration file used to learn rule patterns from annotated `leakage_spans`.
+- `--input-path`: JSONL test file with `prompt`, `response`, and `leakage_spans`.
+- `--output-path`: JSON file where aggregate rule-baseline metrics are saved. Default: `output/rule_based_metrics.json`.
+- `--rules-output-path`: JSON file where the learned exact/generalized rules are saved. Default: `output/rule_based_rules.json`.
+- `--predictions-path`: Optional JSONL path for per-sample predicted leakage text spans, predicted token spans, and sample metrics.
+- `--min-support`: Keep learned rules that appear in at least this many calibration leakage spans. Default: `1`.
+- `--min-words`: Ignore very short leakage spans with fewer words than this. Default: `2`.
+- `--min-chars`: Ignore very short leakage spans with fewer characters than this. Default: `6`.
+- `--max-rules`: Optional cap on the number of learned rules, sorted by support and rule length.
+- `--exact-only`: Use only exact phrase rules. Without this flag, the baseline also learns generalized rules where numbers, LaTeX math, `\boxed{...}`, and bold answer values are replaced by value placeholders.
+- `--max-samples`: Optional cap for quick debugging.
+- `--max-seq-len`: Skip samples longer than this many tokens after prompt and response are concatenated. Default: `2048`.
+- `--disable-thinking`: Disable Qwen thinking in the chat template when rebuilding prompt text.
+- `--trust-remote-code`: Pass `trust_remote_code=True` when loading the tokenizer.
+
 ## Calibrate Then Evaluate
 
 ```bash
