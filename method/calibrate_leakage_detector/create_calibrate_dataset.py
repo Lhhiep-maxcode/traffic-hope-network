@@ -104,6 +104,7 @@ def load_seed_examples(args) -> list[dict]:
     if args.dataset_config:
         dataset_args.append(args.dataset_config)
     dataset = load_dataset(*dataset_args, split=args.split)
+    dataset = dataset.shuffle(seed=42)
 
     seeds = []
     for example in dataset:
