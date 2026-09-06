@@ -1,3 +1,4 @@
+import inspect
 import json
 from pathlib import Path
 
@@ -44,6 +45,13 @@ def _substring_token_indices(tokenizer, text, substring):
 
 
 class TokenByTokenGenerator:
+    """Token generation with reusable prompt tensors and bounded KV rollback.
+
+    ``reuse_kv_cache=False`` restores full-prefill rollback for comparison.
+    Cache reuse preserves sampling/repair rules, but floating-point results of
+    cached decoding and full prefill need not be bit-identical on every backend.
+    """
+
     def __init__(
         self,
         model,
@@ -56,12 +64,14 @@ class TokenByTokenGenerator:
         do_sample=True,
         seed=None,
         enable_thinking=True,
+        reuse_kv_cache=True,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.prompt = prompt
         self.privileged_context = privileged_context
         self.enable_thinking = enable_thinking
+        self.reuse_kv_cache = bool(reuse_kv_cache)
         raw_full_prompt = prompt + (privileged_context or "")
         self.full_prompt = tokenizer.apply_chat_template(
             [
@@ -87,16 +97,180 @@ class TokenByTokenGenerator:
         self.cache_length = 0
         self.generated_ids = []
         self.finished = False
+        self._prompt_ids = None
+        self._tokenized_prompt = None
+        self._mask_buffer = None
+        self._logits_history = {}
+        self._prefill_kwargs = None
+
+    def _prompt_token_ids(self):
+        if self._tokenized_prompt != self.full_prompt:
+            self._prompt_ids = _input_ids(self.tokenizer, self.full_prompt)
+            self._tokenized_prompt = self.full_prompt
+        return self._prompt_ids
+
+    def _mask(self, length):
+        device = torch.device(_model_device(self.model))
+        buffer = self._mask_buffer
+        if buffer is None or buffer.device != device or buffer.shape[1] < length:
+            capacity = max(length, 2 * buffer.shape[1] if buffer is not None else 0)
+            self._mask_buffer = torch.ones((1, capacity), dtype=torch.long, device=device)
+        return self._mask_buffer[:, :length]
+
+    def _last_logits_kwargs(self):
+        # Only opt in when the model explicitly declares the argument. Custom
+        # models accepting **kwargs do not necessarily implement this feature.
+        if self._prefill_kwargs is None:
+            try:
+                parameters = inspect.signature(self.model.forward).parameters
+            except (AttributeError, TypeError, ValueError):
+                parameters = {}
+            self._prefill_kwargs = {}
+            for name in ("logits_to_keep", "num_logits_to_keep"):
+                if name in parameters:
+                    self._prefill_kwargs = {name: 1}
+                    break
+        return self._prefill_kwargs
+
+    def _remember_logits(self):
+        # Keep only the small backtracking window, never whole cache snapshots.
+        position = len(self.generated_ids)
+        self._logits_history[position] = self.next_logits
+        oldest = position - getattr(self, "fix_backtrack", 0)
+        for index in list(self._logits_history):
+            if index < oldest or index > position:
+                del self._logits_history[index]
+
+    def _crop_cache(self, length):
+        """Crop full-attention caches; leave unfamiliar cache layouts alone."""
+        cache = self.past_key_values
+        cache_type = type(cache)
+        if (
+            cache_type.__module__ == "transformers.cache_utils"
+            and cache_type.__name__ == "DynamicCache"
+        ):
+            layers = getattr(cache, "layers", None)
+            if layers is not None:
+                # Sliding/linear/quantized layers may have discarded old states.
+                if not layers or any(
+                    type(layer).__module__ != "transformers.cache_utils"
+                    or type(layer).__name__ != "DynamicLayer"
+                    or layer.get_seq_length() < length
+                    or layer.get_seq_length() not in (self.cache_length, self.cache_length + 1)
+                    for layer in layers
+                ):
+                    return False
+            elif not getattr(cache, "key_cache", None) or any(
+                key.ndim != 4
+                or key.shape[-2] < length
+                or key.shape[-2] not in (self.cache_length, self.cache_length + 1)
+                for key in cache.key_cache
+            ):
+                return False
+            if getattr(cache, "offloading", False):
+                return False
+            cache.crop(length)
+            return True
+        if isinstance(cache, (tuple, list)) and cache and all(
+            isinstance(layer, (tuple, list))
+            and len(layer) == 2
+            and all(
+                isinstance(value, torch.Tensor)
+                and value.ndim == 4
+                and value.shape[-2] >= length
+                and value.shape[-2] in (self.cache_length, self.cache_length + 1)
+                for value in layer
+            )
+            for layer in cache
+        ):
+            self.past_key_values = tuple(
+                tuple(value[..., :length, :] for value in layer) for layer in cache
+            )
+            return True
+        return False
+
+    @torch.no_grad()
+    def _restore_prefix(self, generated_ids):
+        """Reuse the common prefix and evaluate only its missing suffix.
+
+        Unsupported caches and training-mode models retain the full-prefill
+        path. Sampling and repair decisions are independent of this fast path.
+        """
+        generated_ids = [int(token_id) for token_id in generated_ids]
+        if (
+            not getattr(self, "reuse_kv_cache", False)
+            or getattr(self.model, "training", False)
+            or self.past_key_values is None
+            or self._tokenized_prompt != self.full_prompt
+        ):
+            return self.start(generated_ids)
+        rope_scaling = getattr(getattr(self.model, "config", None), "rope_scaling", None)
+        if rope_scaling and rope_scaling.get("rope_type", rope_scaling.get("type")) in {
+            "dynamic", "longrope",
+        }:
+            # These schemes can change earlier keys when sequence length changes.
+            return self.start(generated_ids)
+
+        common = 0
+        for old, new in zip(self.generated_ids, generated_ids):
+            if old != new:
+                break
+            common += 1
+        prompt_length = self._prompt_ids.numel()
+        logits = self._logits_history.get(common)
+        if common == len(generated_ids) and logits is None:
+            if common == 0:
+                return self.start(generated_ids)
+            common -= 1  # Recompute just the final token if its logits expired.
+        if not self._crop_cache(prompt_length + common):
+            return self.start(generated_ids)
+
+        suffix = generated_ids[common:]
+        if suffix:
+            input_ids = torch.tensor(
+                [suffix], dtype=torch.long, device=_model_device(self.model)
+            )
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=self._mask(prompt_length + len(generated_ids)),
+                past_key_values=self.past_key_values,
+                use_cache=True,
+                output_attentions=False,
+                return_dict=True,
+                **self._last_logits_kwargs(),
+            )
+            self.past_key_values = outputs.past_key_values
+            logits = outputs.logits[:, -1, :].clone()
+        self.next_logits = logits
+        self.cache_length = prompt_length + len(generated_ids)
+        self.attention_mask = self._mask(self.cache_length)
+        self.generated_ids = generated_ids
+        self.finished = bool(
+            generated_ids
+            and self.tokenizer.eos_token_id is not None
+            and generated_ids[-1] == self.tokenizer.eos_token_id
+        )
+        # Entries after the common prefix may belong to a discarded branch.
+        self._logits_history = {
+            index: value for index, value in self._logits_history.items()
+            if index <= common
+        }
+        self._remember_logits()
+        return prompt_length
 
     @torch.no_grad()
     def start(self, generated_ids=None):
         """Prefill prompt and rebuild the KV cache at an accepted prefix."""
         generated_ids = [int(token_id) for token_id in (generated_ids or [])]
-        prompt_ids = _input_ids(self.tokenizer, self.full_prompt)
+        prompt_ids = self._prompt_token_ids()
         prefix_ids = torch.tensor(generated_ids, dtype=torch.long)
         input_ids = torch.cat([prompt_ids, prefix_ids]).unsqueeze(0)
         input_ids = input_ids.to(_model_device(self.model))
-        attention_mask = torch.ones_like(input_ids)
+        attention_mask = self._mask(input_ids.shape[1])
+        # Release obsolete cache/logits before allocating a full replacement.
+        self.past_key_values = None
+        self.next_logits = None
+        self._logits_history = {}
 
         outputs = self.model(
             input_ids=input_ids,
@@ -104,11 +278,12 @@ class TokenByTokenGenerator:
             use_cache=True,
             output_attentions=False,
             return_dict=True,
+            **self._last_logits_kwargs(),
         )
 
         self.attention_mask = attention_mask
         self.past_key_values = outputs.past_key_values
-        self.next_logits = outputs.logits[:, -1, :]
+        self.next_logits = outputs.logits[:, -1, :].clone()
         self.cache_length = input_ids.shape[1]
         self.generated_ids = generated_ids
         self.finished = bool(
@@ -116,6 +291,7 @@ class TokenByTokenGenerator:
             and self.tokenizer.eos_token_id is not None
             and generated_ids[-1] == self.tokenizer.eos_token_id
         )
+        self._remember_logits()
         return prompt_ids.numel()
 
     def _sample_token(self, logits):
@@ -150,11 +326,7 @@ class TokenByTokenGenerator:
             dtype=torch.long,
             device=_model_device(self.model),
         )
-        attention_mask = torch.ones(
-            (1, self.cache_length + 1),
-            dtype=torch.long,
-            device=token.device,
-        )
+        attention_mask = self._mask(self.cache_length + 1)
         return self.model(
             input_ids=token,
             attention_mask=attention_mask,
@@ -169,12 +341,9 @@ class TokenByTokenGenerator:
         self.past_key_values = outputs.past_key_values
         self.next_logits = outputs.logits[:, -1, :]
         self.cache_length += 1
-        self.attention_mask = torch.ones(
-            (1, self.cache_length),
-            dtype=torch.long,
-            device=_model_device(self.model),
-        )
+        self.attention_mask = self._mask(self.cache_length)
         self.generated_ids.append(token_id)
+        self._remember_logits()
         self.finished = (
             self.tokenizer.eos_token_id is not None
             and token_id == self.tokenizer.eos_token_id
@@ -330,7 +499,9 @@ class CustomGenerator(TokenByTokenGenerator):
             top_p=self.top_p,
             do_sample=self.do_sample,
             enable_thinking=self.enable_thinking,
+            reuse_kv_cache=self.reuse_kv_cache,
         )
+        self.clean_generator.fix_backtrack = self.fix_backtrack
         self.repairing = False
         self.repair_steps = 0
         self.repair_safe_steps = 0
@@ -350,18 +521,33 @@ class CustomGenerator(TokenByTokenGenerator):
                 "The model did not return attentions. Load it with "
                 "attn_implementation='eager'."
             )
-        scores = []
+        scores = [None] * len(self.heads)
         weights = []
-        token_indices = torch.tensor(
-            self.privileged_context_token_indices,
-            dtype=torch.long,
-        )
+        token_indices = tuple(self.privileged_context_token_indices)
+        if getattr(self, "_attention_indices_key", None) != token_indices:
+            self._attention_indices_key = token_indices
+            self._attention_indices_by_device = {}
+        scores_by_device = {}
 
-        for record in self.heads:
+        for position, record in enumerate(self.heads):
             attention = attentions[int(record["layer"])][0, int(record["head"]), -1]
-            indices = token_indices.to(attention.device)
-            scores.append(float(attention.index_select(0, indices).sum().item()))
+            device = attention.device
+            if device not in self._attention_indices_by_device:
+                self._attention_indices_by_device[device] = torch.tensor(
+                    token_indices, dtype=torch.long, device=device
+                )
+            indices = self._attention_indices_by_device[device]
+            scores_by_device.setdefault(device, []).append(
+                (position, attention.index_select(0, indices).sum())
+            )
             weights.append(max(float(record.get("score", 1.0)), 0.0))
+
+        # One host transfer per device instead of a blocking .item() per head.
+        # Keep each original sum's dtype and Python aggregation order intact.
+        for entries in scores_by_device.values():
+            values = torch.stack([value for _, value in entries]).tolist()
+            for (position, _), value in zip(entries, values):
+                scores[position] = float(value)
 
         if self.aggregation == "mean" or not any(weights):
             return sum(scores) / len(scores)
@@ -405,11 +591,10 @@ class CustomGenerator(TokenByTokenGenerator):
             detected_index if backtrack_suppressed else nominal_start_index
         )
         removed_ids = self.generated_ids[start_index:]
-        del self.generated_ids[start_index:]
 
-        # Rebuild both caches at exactly the same accepted output prefix.
-        TokenByTokenGenerator.start(self, self.generated_ids)
-        self.clean_generator.start(self.generated_ids)
+        # Both branches resume at exactly the same accepted output prefix.
+        self._restore_prefix(self.generated_ids[:start_index])
+        TokenByTokenGenerator._restore_prefix(self.clean_generator, self.generated_ids)
         self.repairing = True
         self.repair_steps = 0
         self.repair_safe_steps = 0
@@ -496,9 +681,14 @@ class CustomGenerator(TokenByTokenGenerator):
                     selected_id = self.clean_generator._sample_token(
                         self.clean_generator.next_logits
                     ).item()
-                    # The speculative forward may mutate a DynamicCache.
-                    TokenByTokenGenerator.start(self, self.generated_ids)
-                    privileged_outputs = None
+                    if (
+                        selected_id != privileged_id
+                        or not getattr(self, "reuse_kv_cache", False)
+                        or getattr(self.model, "training", False)
+                    ):
+                        # Discard the speculative token without redoing prefill.
+                        privileged_outputs = None
+                        self._restore_prefix(self.generated_ids)
 
         self._accept_on_both_branches(selected_id, privileged_outputs)
         event["replacement_token_ids"].append(selected_id)
@@ -576,6 +766,7 @@ class CustomGenerator(TokenByTokenGenerator):
             )
             return candidate_id, token_text, self.finished
 
+        del outputs
         self._start_repair(candidate_id, self.attention_score)
         return self._repair_step()
 
@@ -589,8 +780,15 @@ class CustomGenerator(TokenByTokenGenerator):
         self.repair_events = []
         self.attempts = 0
         if self.seed is not None:
+            # Start fixed generation from the requested RNG state. The
+            # baseline below receives the same seed, so repair-only sampling
+            # cannot shift the unfixed branch's initial random stream.
             torch.manual_seed(self.seed)
         self.start()
+        # A new run may follow a model-weight update; do not reuse clean state
+        # from a previous run. It will be initialized at the first repair.
+        self.clean_generator.past_key_values = None
+        self.clean_generator._logits_history = {}
 
         progress_bar = tqdm(
             total=self.max_new_tokens,
@@ -602,11 +800,7 @@ class CustomGenerator(TokenByTokenGenerator):
             while not self.finished and len(self.generated_ids) < self.max_new_tokens:
                 self.step()
                 # Backtracking can reduce the number of accepted tokens.
-                progress_bar.n = min(
-                    len(self.generated_ids),
-                    self.max_new_tokens,
-                )
-                progress_bar.refresh()
+                progress_bar.update(len(self.generated_ids) - progress_bar.n)
         finally:
             progress_bar.close()
 
@@ -629,6 +823,7 @@ class CustomGenerator(TokenByTokenGenerator):
                 do_sample=self.do_sample,
                 seed=self.seed,
                 enable_thinking=self.enable_thinking,
+                reuse_kv_cache=self.reuse_kv_cache,
             )
             unfixed = baseline.generate(
                 self.max_new_tokens,

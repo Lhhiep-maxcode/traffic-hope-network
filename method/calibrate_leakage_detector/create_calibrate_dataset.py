@@ -18,22 +18,19 @@ from utils.utils import read_jsonl, write_jsonl
 
 
 
-LEAKAGE_INSTRUCTION = "Notice that do not leak the ground truth answer/solution in your reasoning and final answer"
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", default="all", choices=["generate", "judge", "all"])
     parser.add_argument("--generation-model", nargs="+", default=None)
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--input-path", type=Path, default=None)
-    parser.add_argument("--dataset", default="HuggingFaceH4/MATH-500")
+    parser.add_argument("--dataset", default="Hiepppp/reasoning")
     parser.add_argument("--dataset-config", default=None)
-    parser.add_argument("--split", default="test")
-    parser.add_argument("--problem-field", default="problem")
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--problem-field", default="question")
     parser.add_argument("--solution-field", default="solution")
     parser.add_argument("--splitter", default=None)
-    parser.add_argument("--answer-field", default="answer")
+    parser.add_argument("--answer-field", default="ground_truth")
     parser.add_argument("--max-examples", type=int, default=50)
     parser.add_argument("--max-concurrency", type=int, default=8)
     parser.add_argument("--output-path", type=Path, default=None)
@@ -121,8 +118,8 @@ def load_seed_examples(args) -> list[dict]:
 
 def build_prompt(problem: str, answer: str) -> dict:
     return {
-        'prompt': f"{problem} \nGiven the ground truth answer/solution is $\\boxed{{{answer}}}$. {LEAKAGE_INSTRUCTION}",
-        'privileged_context': f"\nGiven the ground truth answer/solution is $\\boxed{{{answer}}}$. {LEAKAGE_INSTRUCTION}"
+        'prompt': f"{problem} \nGiven the ground truth answer is $\\boxed{{{answer}}}$.",
+        'privileged_context': f"\nGiven the ground truth answer is $\\boxed{{{answer}}}$."
     }
 
 
@@ -133,6 +130,15 @@ def leakage_spans(judge_output: str, response: str) -> list[str]:
         if span in response and span not in spans:
             spans.append(span)
     return spans
+
+
+def leakage_label(judge_output: str) -> str:
+    for box in braced_blocks(judge_output, r"\boxed"):
+        match = re.fullmatch(r"\s*(FAILED|PASS)\s*", box.upper())
+        if match:
+            return match.group(1)
+    return "FAILED"
+
 
 
 def openai_client(base_url: str, api_key: str):
@@ -264,12 +270,13 @@ async def judge_rows(args, rows: list[dict], output_path: Path):
             system_prompt=SYSTEM_PROMPT,
             enable_thinking=False,
         )
+        label = leakage_label(judge_output)
         return {
             "generation_model": row["generation_model"],
             "prompt": row["prompt"],
             "response": row["response"],
             "privileged_context": row["privileged_context"],
-            "leakage_spans": leakage_spans(judge_output, row["response"]),
+            "leakage": label == "FAILED",
         }
 
     try:
