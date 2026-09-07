@@ -14,10 +14,6 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.utils import read_jsonl, write_jsonl
-
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", default="all", choices=["generate", "judge", "all"])
@@ -34,6 +30,8 @@ def parse_args():
     parser.add_argument("--max-examples", type=int, default=50)
     parser.add_argument("--max-concurrency", type=int, default=8)
     parser.add_argument("--output-path", type=Path, default=None)
+    parser.add_argument("--generation-output-path", type=Path, default=None)
+    parser.add_argument("--judge-output-path", type=Path, default=None)
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     parser.add_argument("--generation-base-url", default=None)
     parser.add_argument("--judge-base-url", default=None)
@@ -58,11 +56,66 @@ def model_tag(model_names: list[str]) -> str:
     return "-".join(model_slug(name) for name in model_names)
 
 
-def default_output_path(args) -> Path:
+def generation_output_path(args) -> Path:
+    if args.generation_output_path:
+        return args.generation_output_path
+    if args.phase == "generate" and args.output_path:
+        return args.output_path
+    return Path(__file__).with_name("data") / f"{model_tag(args.generation_model)}-generated-responses.jsonl"
+
+
+def judge_output_path(args) -> Path:
+    if args.judge_output_path:
+        return args.judge_output_path
+    if args.phase in {"judge", "all"} and args.output_path:
+        return args.output_path
     if args.phase == "judge":
-        return args.input_path.with_name(f"{args.input_path.stem}-calibrate-dataset.jsonl")
-    suffix = "responses" if args.phase == "generate" else "calibrate-dataset"
-    return Path(__file__).with_name("data") / f"{model_tag(args.generation_model)}-{suffix}.jsonl"
+        return args.input_path.with_name(f"{args.input_path.stem}-judged-leakage.jsonl")
+    return Path(__file__).with_name("data") / f"{model_tag(args.generation_model)}-judged-leakage.jsonl"
+
+
+def same_path(left: Path, right: Path) -> bool:
+    return left.resolve() == right.resolve()
+
+
+def prepare_output(path: Path, overwrite: bool):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if overwrite and path.exists():
+        path.unlink()
+    path.touch(exist_ok=True)
+
+
+def read_jsonl_loose(path: Path, repair: bool = False) -> list[dict]:
+    if not path or not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    rows = []
+    valid_lines = []
+    needs_repair = bool(text and not text.endswith(("\n", "\r")))
+    for line_no, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+            valid_lines.append(line)
+        except json.JSONDecodeError:
+            print(f"Skipping invalid JSONL line {line_no} in {path}")
+            needs_repair = True
+    if repair and needs_repair:
+        path.write_text("\n".join(valid_lines) + ("\n" if valid_lines else ""), encoding="utf-8")
+    return rows
+
+
+def generation_key(row: dict) -> tuple:
+    return row.get("generation_model"), row.get("prompt")
+
+
+def judge_key(row: dict) -> tuple:
+    return row.get("generation_model"), row.get("prompt"), row.get("response")
+
+
+def existing_keys(path: Path, key_fn) -> set[tuple]:
+    return {key_fn(row) for row in read_jsonl_loose(path, repair=True)}
 
 
 def braced_blocks(text: str, command: str) -> list[str]:
@@ -199,63 +252,66 @@ async def complete(
     return (reasoning + content).strip()
 
 
-async def limited_map(items: list, fn, max_concurrency: int, desc: str) -> list:
+async def stream_jsonl(items: list, fn, max_concurrency: int, desc: str, output_path: Path):
     semaphore = asyncio.Semaphore(max_concurrency)
-    results = [None] * len(items)
 
-    async def run(i, item):
+    async def run(item):
         async with semaphore:
-            results[i] = await fn(item)
+            return await fn(item)
 
-    tasks = [asyncio.create_task(run(i, item)) for i, item in enumerate(items)]
-    for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=desc):
-        await task
-    return results
+    tasks = [asyncio.create_task(run(item)) for item in items]
+    with output_path.open("a", encoding="utf-8") as file:
+        for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=desc):
+            row = await task
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+            file.flush()
 
 
-async def generate_rows(args) -> list[dict]:
+async def generate_rows(args, output_path: Path) -> list[dict]:
     seeds = load_seed_examples(args)
     print(f"Loaded {len(seeds)} seed examples from {args.dataset}/{args.split}")
+    done = existing_keys(output_path, generation_key)
 
     base_url = args.generation_base_url or args.base_url
     api_key = args.generation_api_key or args.api_key
     client = openai_client(base_url, api_key)
-    rows = []
+    items = []
+    for model_name in args.generation_model:
+        for seed in seeds:
+            item = {"generation_model": model_name, **build_prompt(seed["problem"], seed["answer"])}
+            if generation_key(item) not in done:
+                items.append(item)
+    print(f"Generation resume: {len(done)} existing rows, {len(items)} remaining rows")
 
     try:
-        for model_name in args.generation_model:
-            prompts = [build_prompt(seed["problem"], seed["answer"]) for seed in seeds]
-
-            async def generate_one(prompt: dict):
-                response = await complete(
-                    client,
-                    model_name,
-                    prompt["prompt"],
-                    args.generation_max_new_tokens,
-                    args.generation_temperature,
-                    enable_thinking=None if not args.disable_thinking else False,
-                )
-                return {
-                    "generation_model": model_name, 
-                    "prompt": prompt["prompt"], 
-                    "privileged_context": prompt["privileged_context"], 
-                    "response": response
-                }
-
-            rows.extend(
-                await limited_map(
-                    prompts,
-                    generate_one,
-                    args.max_concurrency,
-                    desc=f"Generating {model_slug(model_name)}",
-                )
+        async def generate_one(item: dict):
+            response = await complete(
+                client,
+                item["generation_model"],
+                item["prompt"],
+                args.generation_max_new_tokens,
+                args.generation_temperature,
+                enable_thinking=None if not args.disable_thinking else False,
             )
+            return {
+                "generation_model": item["generation_model"],
+                "prompt": item["prompt"],
+                "privileged_context": item["privileged_context"],
+                "response": response,
+            }
+
+        if items:
+            await stream_jsonl(items, generate_one, args.max_concurrency, "Generating", output_path)
     finally:
         await close_client(client)
-    return rows
+    return read_jsonl_loose(output_path)
 
 
 async def judge_rows(args, rows: list[dict], output_path: Path):
+    done = existing_keys(output_path, judge_key)
+    rows = [row for row in rows if judge_key(row) not in done]
+    print(f"Judge resume: {len(done)} existing rows, {len(rows)} remaining rows")
+
     base_url = args.judge_base_url or args.base_url
     api_key = args.judge_api_key or args.api_key
     client = openai_client(base_url, api_key)
@@ -272,19 +328,13 @@ async def judge_rows(args, rows: list[dict], output_path: Path):
             enable_thinking=False,
         )
         label = leakage_label(judge_output)
-        return {
-            "generation_model": row["generation_model"],
-            "prompt": row["prompt"],
-            "response": row["response"],
-            "privileged_context": row["privileged_context"],
-            "leakage": label == "FAILED",
-        }
+        return {**row, "leakage": label == "FAILED"}
 
     try:
-        judged_rows = await limited_map(rows, judge_one, args.max_concurrency, desc="Detecting leakage")
+        if rows:
+            await stream_jsonl(rows, judge_one, args.max_concurrency, "Detecting leakage", output_path)
     finally:
         await close_client(client)
-    write_jsonl(judged_rows, output_path)
 
 
 async def async_main():
@@ -300,18 +350,29 @@ async def async_main():
     if args.phase == "all":
         args.judge_model = args.judge_model or args.generation_model[0]
 
-    output_path = args.output_path or default_output_path(args)
-    if output_path.exists() and not args.overwrite:
-        raise FileExistsError(f"{output_path} exists. Use --overwrite to replace it.")
-
     if args.phase == "generate":
-        write_jsonl(await generate_rows(args), output_path, args.overwrite)
+        output_path = generation_output_path(args)
+        prepare_output(output_path, args.overwrite)
+        await generate_rows(args, output_path)
+        print(f"Saved {output_path}")
     elif args.phase == "judge":
-        await judge_rows(args, read_jsonl(args.input_path), output_path)
+        output_path = judge_output_path(args)
+        if same_path(args.input_path, output_path):
+            raise ValueError("Judge output path must be different from --input-path.")
+        prepare_output(output_path, args.overwrite)
+        await judge_rows(args, read_jsonl_loose(args.input_path), output_path)
+        print(f"Saved {output_path}")
     else:
-        await judge_rows(args, await generate_rows(args), output_path)
-
-    print(f"Saved {output_path}")
+        gen_path = generation_output_path(args)
+        judged_path = judge_output_path(args)
+        if same_path(gen_path, judged_path):
+            raise ValueError("Generation and judge output paths must be different.")
+        prepare_output(gen_path, args.overwrite)
+        prepare_output(judged_path, args.overwrite)
+        rows = await generate_rows(args, gen_path)
+        await judge_rows(args, rows, judged_path)
+        print(f"Saved generated rows to {gen_path}")
+        print(f"Saved judged rows to {judged_path}")
 
 
 def main():
