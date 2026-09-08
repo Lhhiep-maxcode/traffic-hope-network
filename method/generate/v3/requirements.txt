@@ -1,0 +1,4 @@
+# Install the CUDA build of torch appropriate for B200 separately if needed.
+torch>=2.8,<3
+transformers==4.57.6
+accelerate>=1.0,<2
