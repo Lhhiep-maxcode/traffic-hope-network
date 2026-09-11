@@ -140,8 +140,8 @@ def build_inference_sample(row: dict, tokenizer, args) -> dict | None:
 
 
 def build_sample(row: dict, tokenizer, args) -> dict | None:
-    if not row.get("leakage_spans"):
-        return None
+    # if not row.get("leakage_spans"):
+    #     return None
     sample = build_inference_sample(row, tokenizer, args)
     if sample is None:
         return None
@@ -181,7 +181,7 @@ def get_batch_attention_weights(model, tokenizer, samples: list[dict]):
         seq_len = len(sample["input_ids"])
         input_ids[i, :seq_len] = sample["input_ids"]
         attention_mask[i, :seq_len] = 1
-
+    
     with torch.inference_mode():
         output = model(
             input_ids=input_ids.to(model_device(model)),
@@ -204,7 +204,7 @@ def attention_to_context(attentions, prompt_len: int, key_tokens: list[int]) -> 
     return torch.stack([
         layer_attn[0, :, prompt_len:, :].index_select(-1, key_tokens).sum(dim=-1)
         for layer_attn in attentions
-    ])
+    ])  # shape = (num_layers, num_heads, seq_len - prompt_len)
 
 
 def positive_median_normalize(values: torch.Tensor) -> torch.Tensor:
@@ -217,11 +217,11 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def head_scores(attentions, sample: dict) -> torch.Tensor:
     raw = attention_to_context(attentions, sample["prompt_len"], sample["key_tokens"])
-    gold = sample["ideal"].bool()
-    shape = cosine(positive_median_normalize(raw), sample["ideal"])
-    pos = raw[..., gold].mean(dim=-1)
-    neg = raw[..., ~gold].mean(dim=-1) if (~gold).any() else torch.zeros_like(pos)
-    return shape * (pos - neg).clamp_min(0)
+    # gold = sample["ideal"].bool()
+    shape = cosine(raw, sample["ideal"])    # shape = (num_layers, num_heads)
+    # pos = raw[..., gold].mean(dim=-1)
+    # neg = raw[..., ~gold].mean(dim=-1) if (~gold).any() else torch.zeros_like(pos)
+    return shape
 
 
 def top_heads(scores: torch.Tensor, top_k: int) -> list[dict]:
@@ -243,7 +243,7 @@ def aggregate_normalized_vectors(vectors: torch.Tensor, heads: list[dict], aggre
 
 def aggregate_selected_heads(attentions, sample: dict, heads: list[dict], aggregation: str = "weighted") -> torch.Tensor:
     raw = attention_to_context(attentions, sample["prompt_len"], sample["key_tokens"])
-    return aggregate_normalized_vectors(positive_median_normalize(raw), heads, aggregation)
+    return aggregate_normalized_vectors(raw, heads, aggregation)
 
 
 def rolling_max(values: torch.Tensor, window_size: int) -> torch.Tensor:
@@ -393,7 +393,7 @@ def clear_memory():
 
 
 def build_samples(path: Path, tokenizer, args):
-    rows = [row for row in read_jsonl(path) if row.get("leakage_spans")]
+    rows = [row for row in read_jsonl(path)]
     if args.max_samples:
         rows = rows[: args.max_samples]
     samples = [sample for row in rows if (sample := build_sample(row, tokenizer, args)) is not None]
@@ -431,16 +431,17 @@ def load_head_scores(args) -> torch.Tensor:
 
 
 def detector_records_by_k(model, tokenizer, samples: list[dict], scores: torch.Tensor, args):
-    top_ks = int_grid(args.top_k_values, args.top_k, scores.numel())
-    heads_by_k = {k: top_heads(scores, k) for k in top_ks}
+    top_ks = int_grid(args.top_k_values, args.top_k, scores.numel())    # [1, 2, 4, 8, 16, ...]
+    heads_by_k = {k: top_heads(scores, k) for k in top_ks}  # {k: [{"layer": 0, "head": 0, "score": 1.0}, ...], ...}
     records_by_k = {k: [] for k in top_ks}
 
     for batch in tqdm(list(batches(samples, args.batch_size)), desc="Calibrating k/window/threshold"):
         batch_attn = get_batch_attention_weights(model, tokenizer, batch)
         for batch_idx, sample in enumerate(batch):
             sample_attn = take_sample_attentions(batch_attn, batch_idx, len(sample["input_ids"]))
+            # compute real attention vectors to privileged context for each head
             raw = attention_to_context(sample_attn, sample["prompt_len"], sample["key_tokens"])
-            vectors = positive_median_normalize(raw)
+            vectors = raw
             for k, heads in heads_by_k.items():
                 real = aggregate_normalized_vectors(vectors, heads, args.aggregation)
                 records_by_k[k].append({"real": real.cpu(), "ideal": sample["ideal"].cpu()})
@@ -487,13 +488,18 @@ def calibrate(model, tokenizer, args):
 
     samples = build_samples(args.calibrate_path, tokenizer, args)
     val_samples = build_samples(args.val_calibrate_path, tokenizer, args)
+
+    # compute the similarity score for each head
+    # scores shape = (num_layers, num_heads)
     scores = load_head_scores(args) if args.from_cache else calibrate_head_scores(model, tokenizer, samples, args)
 
+    # compute real attention vectors for each data sample by each top-k config
     heads_by_k, records_by_k, top_ks = detector_records_by_k(model, tokenizer, val_samples, scores, args)
     # heads_by_k = {k: [{"layer": 0, "head": 0, "score": 1.0}, ...], ...}
     # records_by_k = {k: [{"real": tensor, "ideal": tensor}, ...], ...}
     # top_ks = [1, 2, 4, 8, 16] or user-specified
 
+    # compute metrics for all posible config
     all_metrics = []
     for k in top_ks:
         rows = [{**row, "model": key, "top_k": k} for row in threshold_metrics(records_by_k[k], args)]
