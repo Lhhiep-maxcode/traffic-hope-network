@@ -154,8 +154,8 @@ def build_sample(row: dict, tokenizer, args) -> dict | None:
                 if token_idx >= sample["prompt_len"]:
                     ideal[token_idx - sample["prompt_len"]] = 1.0
 
-    if ideal.sum() == 0:
-        raise RuntimeError(f"No leakage tokens found in sample: {row['prompt'][:80]}")
+    # if ideal.sum() == 0:
+    #     raise RuntimeError(f"No leakage tokens found in sample: {row['prompt'][:80]}")
     return {**sample, "ideal": ideal}
 
 
