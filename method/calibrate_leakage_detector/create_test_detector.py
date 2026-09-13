@@ -9,16 +9,26 @@ import os
 import sys
 from pathlib import Path
 
-import torch
-import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from method.generate.v3.self_coding import TokenByTokenGenerator
 from method.calibrate_leakage_detector.prompt import JUDGE_SYSTEM_PROMPT
+
+
+def token_generator_cls():
+    from method.generate.v3.self_coding import TokenByTokenGenerator
+
+    return TokenByTokenGenerator
+
+
+def torch_modules():
+    import torch
+    import torch.nn.functional as F
+
+    return torch, F
 
 
 def parse_args():
@@ -30,6 +40,16 @@ def parse_args():
     parser.add_argument("--judge-model", required=True)
     parser.add_argument("--base-url", default="https://api.openai.com/v1")
     parser.add_argument("--api-key", default=None)
+    parser.add_argument(
+        "--generation-backend",
+        choices=["local", "vllm"],
+        default="local",
+        help="Use vLLM/OpenAI-compatible API for initial responses; repair stays local.",
+    )
+    parser.add_argument("--generation-model", default=None, help="Model name served by vLLM.")
+    parser.add_argument("--generation-base-url", default=None)
+    parser.add_argument("--generation-api-key", default=None)
+    parser.add_argument("--max-concurrency", type=int, default=8)
     parser.add_argument(
         "--judge-reasoning-effort",
         choices=["none", "minimal", "low", "medium", "high", "xhigh"],
@@ -101,6 +121,7 @@ def build_prompt(row: dict) -> tuple[str, str, str, str | None, str]:
 
 
 def load_model(args):
+    torch, _ = torch_modules()
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -122,7 +143,7 @@ def load_model(args):
 
 
 def make_generator(model, tokenizer, prompt, context, args, seed):
-    return TokenByTokenGenerator(
+    return token_generator_cls()(
         model=model,
         tokenizer=tokenizer,
         prompt=prompt,
@@ -137,7 +158,17 @@ def make_generator(model, tokenizer, prompt, context, args, seed):
     )
 
 
+def thinking_extra_body(enable_thinking: bool | None, top_k: int = 0):
+    extra_body = {}
+    if enable_thinking is False:
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    if top_k > 0:
+        extra_body["top_k"] = top_k
+    return extra_body or None
+
+
 def js_divergence(left: torch.Tensor, right: torch.Tensor) -> float:
+    torch, F = torch_modules()
     p = F.softmax(left.float(), dim=-1)
     q = F.softmax(right.float(), dim=-1)
     m = (p + q) / 2
@@ -240,19 +271,90 @@ def parse_spans(text: str, response: str) -> list[str]:
     return sorted(spans, key=response.find)
 
 
-def openai_client(args):
+def openai_client(base_url: str, api_key: str | None):
     try:
         from openai import AsyncOpenAI
     except ImportError as exc:
         raise ImportError("Install the OpenAI package with: pip install openai") from exc
-    api_key = args.api_key or os.getenv("OPENAI_API_KEY")
+    api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("Set OPENAI_API_KEY or pass --api-key.")
-    return AsyncOpenAI(base_url=args.base_url, api_key=api_key)
+    return AsyncOpenAI(base_url=base_url, api_key=api_key)
+
+
+def vllm_client(args):
+    base_url = args.generation_base_url or args.base_url
+    api_key = args.generation_api_key or args.api_key or "EMPTY"
+    return openai_client(base_url, api_key)
+
+
+async def close_client(client):
+    result = client.close()
+    if asyncio.iscoroutine(result):
+        await result
+
+
+async def generate_vllm_response(client, args, full_prompt: str) -> str:
+    request = {
+        "model": args.generation_model or args.model,
+        "messages": [{"role": "user", "content": full_prompt}],
+        "max_tokens": args.max_new_tokens,
+    }
+    if args.do_sample:
+        request.update({"temperature": args.temperature, "top_p": args.top_p})
+    else:
+        request["temperature"] = 0.0
+
+    extra_body = thinking_extra_body(
+        None if args.enable_thinking else False,
+        args.top_k,
+    )
+    if extra_body:
+        request["extra_body"] = extra_body
+
+    result = await client.chat.completions.create(**request)
+    message = result.choices[0].message
+    reasoning = (
+        getattr(message, "reasoning", None)
+        or getattr(message, "reasoning_content", None)
+        or ""
+    )
+    content = message.content or ""
+    return (reasoning + content).strip()
+
+
+async def fill_vllm_responses(states: list[dict], args) -> list[dict]:
+    pending = [state for state in states if not state["response"]]
+    if not pending:
+        return states
+
+    client = vllm_client(args)
+    semaphore = asyncio.Semaphore(args.max_concurrency)
+
+    async def generate_one(state: dict):
+        async with semaphore:
+            state["response"] = await generate_vllm_response(
+                client,
+                args,
+                state["full_prompt"],
+            )
+            return state
+
+    try:
+        tasks = [asyncio.create_task(generate_one(state)) for state in pending]
+        for task in tqdm(
+            asyncio.as_completed(tasks),
+            total=len(tasks),
+            desc="Generating with vLLM",
+        ):
+            await task
+    finally:
+        await close_client(client)
+    return states
 
 
 async def judge(client, args, full_prompt: str, context: str, response: str) -> list[str]:
-    user_prompt = f"""
+    base_user_prompt = f"""
 PROMPT WITH PRIVILEGED CONTEXT:
 {full_prompt}
 
@@ -265,8 +367,13 @@ MODEL RESPONSE:
     last_error = None
     for _ in range(args.judge_retries + 1):
         try:
+            user_prompt = base_user_prompt
             if last_error is not None:
-                user_prompt = f"Previous judge attempt failed with error: {last_error}\n\nYour previous response was: \n{result.choices[0].message.content or ''}\n"
+                user_prompt = (
+                    f"{base_user_prompt}\n\n"
+                    f"Previous judge attempt failed with error: {last_error}\n"
+                    "Return only a valid JSON array of exact copied leakage spans."
+                )
             request = {
                 "model": args.judge_model,
                 "messages": [
@@ -287,7 +394,36 @@ MODEL RESPONSE:
     raise ValueError(f"Could not parse judge output after retries: {last_error}")
 
 
+async def fill_initial_spans(states: list[dict], client, args) -> list[dict]:
+    if not states or not all(state["response"] for state in states):
+        return states
+
+    semaphore = asyncio.Semaphore(args.max_concurrency)
+
+    async def judge_one(state: dict):
+        async with semaphore:
+            state["initial_spans"] = await judge(
+                client,
+                args,
+                state["full_prompt"],
+                state["context"],
+                state["response"],
+            )
+            return state
+
+    tasks = [asyncio.create_task(judge_one(state)) for state in states]
+    for task in tqdm(
+        asyncio.as_completed(tasks),
+        total=len(tasks),
+        desc="Initial leakage judging",
+    ):
+        await task
+    return states
+
+
 async def run(args):
+    if args.max_concurrency < 1:
+        raise ValueError("--max-concurrency must be >= 1.")
     if args.max_repair_stages < 0 or args.max_repair_tokens < 1:
         raise ValueError("Repair limits must be positive.")
     if args.min_repair_tokens < 1 or args.safe_steps < 1:
@@ -300,19 +436,58 @@ async def run(args):
     rows = read_jsonl(args.input_path)
     if args.max_samples is not None:
         rows = rows[: args.max_samples]
-    model, tokenizer = load_model(args)
-    client = openai_client(args)
+    states = []
+    for sample_index, row in enumerate(rows):
+        clean_prompt, full_prompt, context, response, source_model = build_prompt(row)
+        generation_model = (
+            source_model
+            or args.model_key
+            or model_key(args.generation_model or args.model)
+        )
+        states.append(
+            {
+                "sample_index": sample_index,
+                "clean_prompt": clean_prompt,
+                "full_prompt": full_prompt,
+                "context": context,
+                "response": response,
+                "generation_model": generation_model,
+            }
+        )
+
+    model = tokenizer = None
+
+    def ensure_local_model():
+        nonlocal model, tokenizer
+        if model is None or tokenizer is None:
+            model, tokenizer = load_model(args)
+        return model, tokenizer
+
+    if args.generation_backend == "vllm":
+        states = await fill_vllm_responses(states, args)
+    else:
+        ensure_local_model()
+
+    client = openai_client(args.base_url, args.api_key)
+    if all(state["response"] for state in states):
+        states = await fill_initial_spans(states, client, args)
+
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     if args.overwrite and args.output_path.exists():
         args.output_path.unlink()
 
     try:
         with args.output_path.open("a", encoding="utf-8") as output:
-            for sample_index, row in enumerate(tqdm(rows, desc="Creating test trajectories")):
-                clean_prompt, full_prompt, context, response, source_model = build_prompt(row)
-                generation_model = source_model or args.model_key or model_key(args.model)
+            for state in tqdm(states, desc="Creating test trajectories"):
+                sample_index = state["sample_index"]
+                clean_prompt = state["clean_prompt"]
+                full_prompt = state["full_prompt"]
+                context = state["context"]
+                response = state["response"]
+                generation_model = state["generation_model"]
 
                 if not response:
+                    model, tokenizer = ensure_local_model()
                     generator = make_generator(
                         model,
                         tokenizer,
@@ -327,9 +502,16 @@ async def run(args):
                     )["text"]
 
                 for stage in range(args.max_repair_stages + 1):
-                    spans = await judge(client, args, full_prompt, context, response)
+                    if stage == 0 and "initial_spans" in state:
+                        spans = state["initial_spans"]
+                    else:
+                        spans = await judge(client, args, full_prompt, context, response)
                     first_span = spans[0] if spans else None
-                    first_span_end_index = response.find(first_span) + len(first_span) if first_span else -1
+                    first_span_end_index = (
+                        response.find(first_span) + len(first_span)
+                        if first_span
+                        else len(response)
+                    )
                     output_row = {
                         "generation_model": generation_model,
                         "prompt": full_prompt,
@@ -343,6 +525,7 @@ async def run(args):
                     if not spans or stage == args.max_repair_stages:
                         break
 
+                    model, tokenizer = ensure_local_model()
                     repaired = repair_response(
                         model,
                         tokenizer,
@@ -357,7 +540,7 @@ async def run(args):
                         break
                     response = repaired
     finally:
-        await client.close()
+        await close_client(client)
 
 
 def main():
