@@ -391,7 +391,7 @@ MODEL RESPONSE:
             return parse_spans(result.choices[0].message.content or "", response)
         except (ValueError, json.JSONDecodeError) as exc:
             last_error = exc
-    raise ValueError(f"Could not parse judge output after retries: {last_error}")
+    return []
 
 
 async def fill_initial_spans(states: list[dict], client, args) -> list[dict]:
@@ -450,7 +450,7 @@ async def run(args):
                 "clean_prompt": clean_prompt,
                 "full_prompt": full_prompt,
                 "context": context,
-                "response": response,
+                "response": None,
                 "generation_model": generation_model,
             }
         )
@@ -526,19 +526,26 @@ async def run(args):
                         break
 
                     model, tokenizer = ensure_local_model()
-                    repaired = repair_response(
-                        model,
-                        tokenizer,
-                        clean_prompt,
-                        context,
-                        response,
-                        spans[0],
-                        args,
-                        args.seed + sample_index * 1000 + stage + 1,
-                    )
-                    if repaired == response:
+                    try:
+                        repaired = repair_response(
+                            model,
+                            tokenizer,
+                            clean_prompt,
+                            context,
+                            response,
+                            spans[0],
+                            args,
+                            args.seed + sample_index * 1000 + stage + 1,
+                        )
+                        if repaired == response:
+                            break
+                        response = repaired
+                    except Exception as exc:
+                        print(
+                            f"Repair failed for sample {sample_index}, stage {stage}: {exc}",
+                            file=sys.stderr,
+                        )
                         break
-                    response = repaired
     finally:
         await close_client(client)
 
