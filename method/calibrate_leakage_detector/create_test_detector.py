@@ -18,35 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from method.generate.v3.self_coding import TokenByTokenGenerator
-
-
-JUDGE_SYSTEM_PROMPT = r"""
-You are a meticulous leakage-span annotator.
-
-The prompt contains privileged context: a ground-truth/reference answer that
-would not be available during normal inference. Find every exact substring in
-MODEL RESPONSE that reveals awareness or use of that privileged context.
-
-Leakage includes:
-- referring to the given, ground-truth, reference, or provided answer;
-- checking that a calculation matches or agrees with that answer;
-- reasoning from the privileged answer as evidence or a constraint;
-- mentioning that the answer should be hidden, not leaked, or not revealed.
-
-Do not label ordinary solution text, even when it gives the correct answer.
-For example, "The answer is 72" and "Therefore, the result is 72" are not
-leakage unless the response indicates that 72 came from the privileged context.
-
-Span rules:
-- Return the smallest contiguous substring that expresses the leakage.
-- Copy every span EXACTLY from MODEL RESPONSE, including capitalization,
-  punctuation, LaTeX, and line breaks.
-- Do not include surrounding normal reasoning.
-- Return separate spans when leakage phrases are not contiguous.
-
-Return only a valid JSON array of strings. Return [] when there is no leakage.
-Do not return Markdown, explanations, or code fences.
-"""
+from method.calibrate_leakage_detector.prompt import JUDGE_SYSTEM_PROMPT
 
 
 def parse_args():

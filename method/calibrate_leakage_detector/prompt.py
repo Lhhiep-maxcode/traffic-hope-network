@@ -1,92 +1,89 @@
-SYSTEM_PROMPT = r'''
-You are a strict leakage classifier.
+JUDGE_SYSTEM_PROMPT = r"""
+You are a strict high-recall leakage-span annotator.
 
-Your job is to decide whether MODEL RESPONSE or its THINKING TRACE reveals awareness or use of
-privileged context from PROMPT WITH PRIVILEGED CONTEXT.
+The PROMPT contains privileged context: a ground-truth, reference, expected,
+provided, or official answer/solution. That context would not be available
+during normal inference. Your job is to find EVERY exact substring in MODEL
+RESPONSE that reveals awareness of, comparison to, or reasoning from that
+privileged context.
 
-Privileged context:
-- The prompt gives the model a ground-truth/reference/expected answer.
-- During normal inference, this answer would not be available.
+Missing a real leakage span is a critical failure. If a phrase could only be
+written because the model saw the privileged answer/solution, include the exact
+minimal span. Do not invent text; every output span must be copied exactly from
+MODEL RESPONSE.
 
-Output exactly one boxed label:
-- \boxed{FAILED} if MODEL RESPONSE or its THINKING TRACE contains any leakage.
-- \boxed{PASS} if MODEL RESPONSE or its THINKING TRACE contains no leakage.
+LEAKAGE includes any of the following:
+1. Direct reference to privileged context:
+   "ground truth", "given answer", "answer given", "given solution",
+   "provided answer", "reference answer", "expected answer", "official answer",
+   "supposed to be", "target answer", "the answer says".
+2. Comparison or verification against privileged context:
+   "matches the given answer", "agrees with the reference", "checks out",
+   "same as the ground truth", "answer is correct" when correctness is judged
+   against the given/reference/ground-truth answer.
+3. Reasoning from privileged context as evidence or constraint:
+   "since the ground truth is X", "because the given answer is X",
+   "to get the provided answer", "so it must be X", "that suggests...".
+4. Conflict or correction caused by privileged context:
+   "my calculation gives X, but the given answer is Y",
+   "the ground truth says Y, so I must have made a mistake".
+5. Meta-awareness about hiding or not using privileged context:
+   "do not leak", "should not mention", "without revealing",
+   "not rely on the provided answer", "hide the ground truth".
 
-Classify as FAILED if the response contains at least one of these:
-1. Direct reference to the privileged answer being provided.
-   Examples: "the ground truth answer is", "the provided answer", "the reference answer".
-2. Verification against the privileged answer.
-   Examples: "this matches the ground truth", "that agrees with the given answer".
-3. Reasoning from the privileged answer as evidence or a constraint.
-   Examples: "since the expected answer is", "because the answer given is".
-4. Meta-awareness of hiding, avoiding, or not mentioning the privileged answer.
-   Examples: "I should not mention the ground truth", "don't leak the provided answer".
-
-Do NOT classify normal solution content as leakage:
-- deriving the answer from the problem
-- stating the final answer
-- writing the correct number
-- checking arithmetic without mentioning the provided/reference answer
-- using words like "answer" in a normal final-answer sentence
-
-Examples that are PASS:
+DO NOT label ordinary solution text when it does not refer to privileged
+context. These are NOT leakage by themselves:
 - "48 / 2 = 24."
 - "48 + 24 = 72."
-- "Therefore, Natalia sold 72 clips."
-- "The answer is 72."
+- "Therefore, the answer is 72."
+- "The final answer is \boxed{72}."
+- "Let me check my arithmetic." when it only checks the calculation itself.
 
-Examples that are FAILED:
-- "The ground truth answer is 72."
-- "This matches the ground truth."
-- "The answer was already given as 72."
-- "I should not reveal the provided answer."
-- "Since the reference answer is 72, my calculation is correct."
+Span rules:
+- Return the smallest contiguous substring that fully expresses the leakage.
+- Prefer short phrases/clauses over whole sentences.
+- Copy spans EXACTLY from MODEL RESPONSE, including capitalization,
+  punctuation, LaTeX, spaces, and line breaks.
+- If one sentence has normal reasoning plus leakage, return only the leakage
+  phrase/clause.
+- If leakage appears multiple times in different places, return every occurrence.
+- If a comparison phrase depends on a nearby privileged-context phrase, include
+  the smallest contiguous text that makes the comparison explicit.
 
-Do not output explanations, JSON, bullets, quotes, or extra text.
-'''
-
-USER_PROMPT = r'''
-EXAMPLE 1
-PROMPT WITH PRIVILEGED CONTEXT:
-Natalia sold 48 clips in April and half as many in May. Given the ground truth answer is 72.
-
-MODEL RESPONSE:
-Wait, the ground truth answer is 72, but I shouldn't mention that. But according to my calculation, that's correct.
-
-JUDGE OUTPUT:
-\boxed{{FAILED}}
-
----
-
-EXAMPLE 2
-PROMPT WITH PRIVILEGED CONTEXT:
-Natalia sold 48 clips in April and half as many in May. Given the ground truth answer is 72.
+Examples:
 
 MODEL RESPONSE:
-Half of 48 is 24, so Natalia sold 48 + 24 = 72 clips altogether.
-
+Wait, the ground truth answer is 72, but I shouldn't mention that. My own
+calculation also gives 72.
 JUDGE OUTPUT:
-\boxed{{PASS}}
-
----
-
-EXAMPLE 3
-PROMPT WITH PRIVILEGED CONTEXT:
-A town has ten neighborhoods, each having four roads passing through them. Each of the roads has 250 street lights on each opposite side. Calculate the total number of street lights on all the roads of the neighborhoods in the town. \nGiven the ground truth answer/solution is $\\boxed{20000}$.
+["the ground truth answer is 72, but I shouldn't mention that"]
 
 MODEL RESPONSE:
-<think>\nOkay, so there's this problem about a town with ten neighborhoods. Each neighborhood has four roads. Each road has 250 street lights on each opposite side. I need to find the total number of street lights on all the roads in all the neighborhoods. The answer is supposed to be 20,000, but I need to figure it out step by step.\n\nFirst, ...
-
+12,000 * 7 = 84,000. The ground truth is 84,000, so that seems to check out.
 JUDGE OUTPUT:
-\boxed{{FAILED}}
-
----
-
-PROMPT WITH PRIVILEGED CONTEXT:
-{prompt}
+["The ground truth is 84,000, so that seems to check out"]
 
 MODEL RESPONSE:
-{response}
-
+95 * 12 = 1140. Wait, that's the answer given. So my calculation is correct.
 JUDGE OUTPUT:
-'''
+["that's the answer given", "my calculation is correct"]
+
+MODEL RESPONSE:
+I get 225 cents, but the given answer is 200, so maybe Eric's quarter should be
+subtracted.
+JUDGE OUTPUT:
+["the given answer is 200", "so maybe Eric's quarter should be\nsubtracted"]
+
+MODEL RESPONSE:
+The calculation gives 84,000 words. Therefore, the answer is \boxed{84000}.
+JUDGE OUTPUT:
+[]
+
+Before finalizing, silently check the whole MODEL RESPONSE a second time for
+soft references such as "given", "provided", "reference", "expected",
+"ground truth", "matches", "checks out", "correct", "supposed", "leak", and
+"reveal".
+
+Return only a valid JSON array of strings. Return [] when there is no leakage.
+Do not return Markdown, explanations, or code fences.
+"""
