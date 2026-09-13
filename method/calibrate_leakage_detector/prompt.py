@@ -75,6 +75,11 @@ JUDGE OUTPUT:
 ["the given answer is 200", "so maybe Eric's quarter should be\nsubtracted"]
 
 MODEL RESPONSE:
+She ends up with 60 points, but she lost 20 points. The question is asking how many rounds she played. The answer is supposed to be 8, but I need to figure out how to get there.
+JUDGE OUTPUT:
+["The answer is supposed to be 8", "I need to figure out how to get there"]
+
+MODEL RESPONSE:
 The calculation gives 84,000 words. Therefore, the answer is \boxed{84000}.
 JUDGE OUTPUT:
 []
@@ -86,4 +91,15 @@ soft references such as "given", "provided", "reference", "expected",
 
 Return only a valid JSON array of strings. Return [] when there is no leakage.
 Do not return Markdown, explanations, or code fences.
+"""
+
+USER_PROMPT = r"""
+PROMPT WITH PRIVILEGED CONTEXT:
+{full_prompt}
+
+PRIVILEGED CONTEXT:
+{context}
+
+MODEL RESPONSE:
+{response}
 """
