@@ -251,10 +251,13 @@ def openai_client(args):
     return AsyncOpenAI(base_url=args.base_url, api_key=api_key)
 
 
-async def judge(client, args, full_prompt: str, response: str) -> list[str]:
+async def judge(client, args, full_prompt: str, context: str, response: str) -> list[str]:
     user_prompt = f"""
 PROMPT WITH PRIVILEGED CONTEXT:
 {full_prompt}
+
+PRIVILEGED CONTEXT:
+{context}
 
 MODEL RESPONSE:
 {response}
@@ -324,7 +327,7 @@ async def run(args):
                     )["text"]
 
                 for stage in range(args.max_repair_stages + 1):
-                    spans = await judge(client, args, full_prompt, response)
+                    spans = await judge(client, args, full_prompt, context, response)
                     first_span = spans[0] if spans else None
                     first_span_end_index = response.find(first_span) + len(first_span) if first_span else -1
                     output_row = {
