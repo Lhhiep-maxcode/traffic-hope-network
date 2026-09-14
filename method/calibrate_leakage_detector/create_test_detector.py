@@ -87,6 +87,52 @@ def read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in file if line.strip()]
 
 
+def progress_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.name}.progress.json")
+
+
+def truncate_file(path: Path, size: int):
+    if not path.exists():
+        return
+    with path.open("rb+") as file:
+        file.truncate(max(0, min(size, path.stat().st_size)))
+
+
+def output_prompts(path: Path) -> set[str]:
+    prompts = set()
+    valid_end = 0
+    if not path.exists():
+        return prompts
+
+    with path.open("rb") as file:
+        while True:
+            line = file.readline()
+            if not line:
+                break
+            if not line.strip():
+                valid_end = file.tell()
+                continue
+            try:
+                row = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                break
+            if isinstance(row.get("prompt"), str):
+                prompts.add(row["prompt"])
+            valid_end = file.tell()
+
+    truncate_file(path, valid_end)
+    return prompts
+
+
+def prepare_output_resume(args) -> set[str]:
+    if args.overwrite:
+        if args.output_path.exists():
+            args.output_path.unlink()
+        progress_path(args.output_path).unlink(missing_ok=True)
+        return set()
+    return output_prompts(args.output_path)
+
+
 def model_key(model: str) -> str:
     return Path(model.rstrip("/\\")).name
 
@@ -455,6 +501,16 @@ async def run(args):
             }
         )
 
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    processed_prompts = prepare_output_resume(args)
+    if processed_prompts:
+        original_count = len(states)
+        states = [state for state in states if state["full_prompt"] not in processed_prompts]
+        print(f"Resume: skipping {original_count - len(states)} prompts found in output")
+    if not states:
+        print("Resume: all input rows are already completed")
+        return
+
     model = tokenizer = None
 
     def ensure_local_model():
@@ -471,10 +527,6 @@ async def run(args):
     client = openai_client(args.base_url, args.api_key)
     if all(state["response"] for state in states):
         states = await fill_initial_spans(states, client, args)
-
-    args.output_path.parent.mkdir(parents=True, exist_ok=True)
-    if args.overwrite and args.output_path.exists():
-        args.output_path.unlink()
 
     try:
         with args.output_path.open("a", encoding="utf-8") as output:
