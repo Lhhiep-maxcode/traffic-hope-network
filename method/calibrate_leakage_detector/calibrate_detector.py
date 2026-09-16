@@ -364,13 +364,13 @@ def best_config_criteria(row: dict) -> tuple:
 
 
 def choose_config(rows: list[dict], args) -> dict:
-    feasible = [r for r in rows if r["full_recall"] >= 0.8 and r['threshold'] > 0]
+    feasible = [r for r in rows if r["recall"] >= 0.8 and r['threshold'] > 0]
     if feasible:
         return max(feasible, key=best_config_criteria)
     return max(
         rows,
         key=lambda r: (
-            r["full_recall"],
+            r["recall"],
             best_config_criteria(r)[0],
             -r.get("top_k", 0),
             -r["window_size"],
