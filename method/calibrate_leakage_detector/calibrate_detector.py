@@ -370,21 +370,63 @@ def calibrate_head_scores(model, tokenizer, samples: list[dict], args) -> torch.
     return scores
 
 
-def load_head_scores(args) -> torch.Tensor:
+def head_score_sum(model, tokenizer, samples: list[dict], args, desc: str) -> tuple[torch.Tensor, int]:
+    total, used = None, 0
+    for batch in tqdm(list(batches(samples, args.batch_size)), desc=desc):
+        batch_attn = get_batch_attention_weights(model, tokenizer, batch)
+        for batch_idx, sample in enumerate(batch):
+            sample_attn = take_sample_attentions(batch_attn, batch_idx, len(sample["input_ids"]))
+            scores = head_scores(sample_attn, sample)
+            total = scores if total is None else total + scores
+            used += 1
+        del batch_attn
+        clear_memory()
+    if total is None:
+        raise RuntimeError(f"No samples available for {desc}.")
+    return total, used
+
+
+def load_head_scores(model, tokenizer, samples: list[dict], args) -> torch.Tensor:
     cache = torch.load(args.score_cache_path, map_location="cpu")
     if cache.get("model") != model_name_key(args):
         warnings.warn(
             f"Cache is for {cache.get('model')}, but --model is {model_name_key(args)}.",
             UserWarning,
         )
-    if cache.get("score_method") != SCORE_METHOD:
-        warnings.warn(
-            "Head-score cache was created with an older/different scoring method. "
-            "Recompute without --from-cache to include non-leakage top-5 penalties.",
-            UserWarning,
+    if cache.get("score_method") == SCORE_METHOD:
+        print(f"Loaded head scores from {args.score_cache_path}.")
+        return cache["scores"]
+
+    if int(cache.get("used", -1)) != len(samples):
+        raise ValueError(
+            "Old head-score cache cannot be upgraded because cache['used'] "
+            f"={cache.get('used')} but current usable samples={len(samples)}. "
+            "Run without --from-cache to recompute from scratch."
         )
+
+    print("Legacy: Upgrading old head-score cache to new score method.")
+    empty_samples = [sample for sample in samples if not sample["ideal"].bool().any()]
+    if empty_samples:
+        empty_total, empty_used = head_score_sum(
+            model,
+            tokenizer,
+            empty_samples,
+            args,
+            desc="Scoring empty-leakage samples",
+        )
+        scores = cache["scores"].float() + empty_total / len(samples)
+    else:
+        empty_used = 0
+
+    torch.save({
+        "model": model_name_key(args),
+        "score_method": SCORE_METHOD,
+        "scores": scores.cpu(),
+        "used": len(samples),
+    }, args.score_cache_path)
     print(f"Loaded head scores from {args.score_cache_path}.")
-    return cache["scores"]
+    print(f"Upgraded old cache with {empty_used} empty-leakage samples.")
+    return scores
 
 
 def detector_records_by_k(model, tokenizer, samples: list[dict], scores: torch.Tensor, args):
@@ -448,7 +490,7 @@ def calibrate(model, tokenizer, args):
 
     # compute the similarity score for each head
     # scores shape = (num_layers, num_heads)
-    scores = load_head_scores(args) if args.from_cache else calibrate_head_scores(model, tokenizer, samples, args)
+    scores = load_head_scores(model, tokenizer, samples, args) if args.from_cache else calibrate_head_scores(model, tokenizer, samples, args)
 
     # compute real attention vectors for each data sample by each top-k config
     heads_by_k, records_by_k, top_ks = detector_records_by_k(model, tokenizer, val_samples, scores, args)
