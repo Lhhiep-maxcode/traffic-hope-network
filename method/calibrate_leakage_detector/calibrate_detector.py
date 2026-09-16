@@ -20,6 +20,7 @@ from utils.utils import build_prompt, load_model_and_tokenizer, read_json, read_
 
 EPS = 1e-12
 PRIVILEGED_MARKER = "Given the ground truth answer is "
+SCORE_METHOD = "leakage_cosine_or_non_leak_top5_penalty"
 
 
 def parse_args():
@@ -215,13 +216,22 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a * b).sum(dim=-1) / (a.norm(dim=-1) * b.norm()).clamp_min(EPS)
 
 
+def topk_mean(values: torch.Tensor, k: int = 5) -> torch.Tensor:
+    if values.shape[-1] == 0:
+        return torch.zeros(values.shape[:-1], dtype=values.dtype, device=values.device)
+    k = min(k, values.shape[-1])
+    return values.topk(k, dim=-1).values.mean(dim=-1)
+
+
+def leakage_shape_score(real: torch.Tensor, ideal: torch.Tensor) -> torch.Tensor:
+    if bool(ideal.bool().any()):
+        return cosine(real, ideal)
+    return -topk_mean(real)
+
+
 def head_scores(attentions, sample: dict) -> torch.Tensor:
     raw = attention_to_context(attentions, sample["prompt_len"], sample["key_tokens"])
-    # gold = sample["ideal"].bool()
-    shape = cosine(raw, sample["ideal"])    # shape = (num_layers, num_heads)
-    # pos = raw[..., gold].mean(dim=-1)
-    # neg = raw[..., ~gold].mean(dim=-1) if (~gold).any() else torch.zeros_like(pos)
-    return shape
+    return leakage_shape_score(raw, sample["ideal"])  # shape = (num_layers, num_heads)
 
 
 def top_heads(scores: torch.Tensor, top_k: int) -> list[dict]:
@@ -273,16 +283,31 @@ def token_spans(mask: torch.Tensor) -> list[dict]:
 def shape_metrics(records: list[dict], args) -> list[dict]:
     rows = []
     for window_size in int_grid(args.window_sizes):
-        scores = [
-            float(cosine(rolling_max(record["real"], window_size), record["ideal"]))
-            for record in records
-        ]
+        scores, leakage_scores, non_leak_penalties = [], [], []
+        for record in records:
+            real = rolling_max(record["real"], window_size)
+            if bool(record["ideal"].bool().any()):
+                score = float(cosine(real, record["ideal"]))
+                leakage_scores.append(score)
+            else:
+                penalty = float(topk_mean(real))
+                score = -penalty
+                non_leak_penalties.append(penalty)
+            scores.append(score)
         score_tensor = torch.tensor(scores)
         rows.append({
             "window_size": window_size,
-            "mean_cosine": float(score_tensor.mean()),
-            "median_cosine": float(score_tensor.median()),
-            "min_cosine": float(score_tensor.min()),
+            "mean_score": float(score_tensor.mean()),
+            "median_score": float(score_tensor.median()),
+            "min_score": float(score_tensor.min()),
+            "leakage_samples": len(leakage_scores),
+            "non_leakage_samples": len(non_leak_penalties),
+            "mean_leakage_cosine": (
+                float(torch.tensor(leakage_scores).mean()) if leakage_scores else None
+            ),
+            "mean_non_leak_top5": (
+                float(torch.tensor(non_leak_penalties).mean()) if non_leak_penalties else None
+            ),
             "samples": len(records),
         })
     return rows
@@ -292,8 +317,8 @@ def choose_config(rows: list[dict], args) -> dict:
     return max(
         rows,
         key=lambda r: (
-            r["mean_cosine"],
-            r["median_cosine"],
+            r["mean_score"],
+            r["median_score"],
             -r["window_size"],
             -r.get("top_k", 0),
         ),
@@ -336,7 +361,12 @@ def calibrate_head_scores(model, tokenizer, samples: list[dict], args) -> torch.
         clear_memory()
 
     scores = total / used
-    torch.save({"model": model_name_key(args), "scores": scores.cpu(), "used": used}, args.score_cache_path)
+    torch.save({
+        "model": model_name_key(args),
+        "score_method": SCORE_METHOD,
+        "scores": scores.cpu(),
+        "used": used,
+    }, args.score_cache_path)
     return scores
 
 
@@ -345,6 +375,12 @@ def load_head_scores(args) -> torch.Tensor:
     if cache.get("model") != model_name_key(args):
         warnings.warn(
             f"Cache is for {cache.get('model')}, but --model is {model_name_key(args)}.",
+            UserWarning,
+        )
+    if cache.get("score_method") != SCORE_METHOD:
+        warnings.warn(
+            "Head-score cache was created with an older/different scoring method. "
+            "Recompute without --from-cache to include non-leakage top-5 penalties.",
             UserWarning,
         )
     print(f"Loaded head scores from {args.score_cache_path}.")
@@ -383,9 +419,9 @@ def save_detector_config(heads: list[dict], best: dict, args):
         "aggregation": args.aggregation,
         "window_size": best["window_size"],
         "threshold": None,
-        "val_calibration_mean_cosine": best["mean_cosine"],
-        "val_calibration_median_cosine": best["median_cosine"],
-        "val_calibration_min_cosine": best["min_cosine"],
+        "val_calibration_mean_score": best["mean_score"],
+        "val_calibration_median_score": best["median_score"],
+        "val_calibration_min_score": best["min_score"],
         "test_precision": None,
         "test_recall": None,
         "test_full_recall": None,
@@ -396,8 +432,8 @@ def save_detector_config(heads: list[dict], best: dict, args):
     write_json(config, args.detector_config_path)
     print(
         f"top_k={best['top_k']} window={best['window_size']} "
-        f"mean_cosine={best['mean_cosine']:.4f} "
-        f"median_cosine={best['median_cosine']:.4f}"
+        f"mean_score={best['mean_score']:.4f} "
+        f"median_score={best['median_score']:.4f}"
     )
 
 
@@ -420,7 +456,7 @@ def calibrate(model, tokenizer, args):
     # records_by_k = {k: [{"real": tensor, "ideal": tensor}, ...], ...}
     # top_ks = [1, 2, 4, 8, 16] or user-specified
 
-    # compute cosine shape metrics for all possible top-k/window configs
+    # compute leakage cosine or non-leakage top-5-mean penalty for all top-k/window configs
     all_metrics = []
     for k in top_ks:
         rows = [{**row, "model": key, "top_k": k} for row in shape_metrics(records_by_k[k], args)]
