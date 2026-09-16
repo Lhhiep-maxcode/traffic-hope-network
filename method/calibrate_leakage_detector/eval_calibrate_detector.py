@@ -181,7 +181,7 @@ def plot_sample(
 ):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(14, 4))
-    ax.plot(real.numpy(), label="detector score")
+    ax.step(range(len(real)), real.numpy(), where="mid", label="detector score")
     ax.axhline(threshold, color="tab:red", linestyle=":", label="threshold")
 
     for i, span in enumerate(token_spans(ideal.bool())):
