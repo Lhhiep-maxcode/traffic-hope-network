@@ -5,110 +5,178 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
+import sys
 from pathlib import Path
 
 from tqdm.auto import tqdm
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-JUDGE_PROMPT = r"""
-You are a strict leakage-span judge.
-
-The prompt contains a privileged ground-truth answer. Find every smallest
-contiguous substring in the model response that reveals awareness or use of
-that privileged answer. Leakage includes referring to the given/reference
-answer, checking a result against it, reasoning from it, or mentioning that it
-should be hidden. Normal derivation and stating a correct answer are not
-leakage by themselves.
-
-Return only a valid JSON array of exact strings copied from the response.
-Return [] if there is no leakage. Do not return explanations or Markdown.
-"""
-
-
-REPHRASE_PROMPT = r"""
-Rewrite MODEL RESPONSE to remove the listed leakage spans.
-
-PROBLEM WITHOUT PRIVILEGED CONTEXT:
-{prompt}
-
-Requirements:
-- Preserve the mathematical/logical meaning, answer, and useful reasoning.
-- Keep the response fluent and natural.
-- Change as little surrounding text as possible.
-- Do not mention the ground-truth, given, reference, or provided answer.
-- Do not mention leakage, this rewrite instruction, or privileged context.
-- If the response contains <think>...</think>, preserve those tags.
-- Return only the rewritten response inside the required XML tags.
-
-LEAKAGE SPANS:
-{spans}
-
-MODEL RESPONSE:
-{response}
-
-Output exactly:
-<REWRITTEN_RESPONSE>
-your rewritten response
-</REWRITTEN_RESPONSE>
-"""
+try:
+    from rephrase_prompt import REPHRASE_PROMPT, REPHRASE_SYSTEM_PROMPT
+except ImportError:
+    from baseline.rephrase_prompt import (
+        REPHRASE_PROMPT,
+        REPHRASE_SYSTEM_PROMPT,
+    )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-path", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, required=True)
     parser.add_argument("--model", required=True, help="Model name served by vLLM.")
+    parser.add_argument("--dataset", default="Hiepppp/reasoning")
+    parser.add_argument("--dataset-config", default=None)
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--problem-field", default="question")
+    parser.add_argument("--solution-field", default="solution")
+    parser.add_argument("--answer-field", default="ground_truth")
+    parser.add_argument("--splitter", default=None)
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     parser.add_argument("--api-key", default="EMPTY")
     parser.add_argument("--max-concurrency", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
-    parser.add_argument("--judge-max-tokens", type=int, default=512)
     parser.add_argument("--rewrite-max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--disable-thinking", action="store_true")
-    parser.add_argument("--max-rounds", type=int, default=3)
-    parser.add_argument("--judge-retries", type=int, default=2)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    with path.open(encoding="utf-8") as file:
-        return [json.loads(line) for line in file if line.strip()]
+def braced_blocks(text: str, command: str = r"\boxed") -> list[str]:
+    blocks, pos = [], 0
+    while True:
+        start = text.find(command, pos)
+        if start < 0:
+            return blocks
+        pos = start + len(command)
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text) or text[pos] != "{":
+            continue
+        depth, chars = 0, []
+        for i, char in enumerate(text[pos + 1 :], pos + 1):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                if depth == 0:
+                    blocks.append("".join(chars).strip())
+                    pos = i + 1
+                    break
+                depth -= 1
+            chars.append(char)
 
 
-def get_prompts(row: dict) -> tuple[str, str, str, str | None, str]:
-    if "prompt" in row and "privileged_context" in row:
-        full_prompt = str(row["prompt"])
-        context = str(row["privileged_context"])
-        if not context or context not in full_prompt:
-            raise ValueError("privileged_context must occur in prompt.")
-        return (
-            full_prompt.replace(context, "", 1),
-            full_prompt,
-            context,
-            row.get("response"),
-            str(row.get("generation_model", "")),
+def parse_answer(example: dict, solution_field: str, answer_field: str, splitter: str | None):
+    answer = example.get(answer_field)
+    if answer is not None:
+        return str(answer).strip()
+    solution = str(example.get(solution_field, ""))
+    if splitter and splitter in solution:
+        return solution.split(splitter)[-1].strip()
+    boxes = braced_blocks(solution)
+    return boxes[-1] if boxes else None
+
+
+def load_seed_examples(args) -> list[dict]:
+    from datasets import load_dataset
+
+    dataset_args = [args.dataset]
+    if args.dataset_config:
+        dataset_args.append(args.dataset_config)
+    dataset = load_dataset(*dataset_args, split=args.split).shuffle(seed=42)
+
+    rows = []
+    for example in dataset:
+        problem = example.get(args.problem_field)
+        answer = parse_answer(
+            example,
+            args.solution_field,
+            args.answer_field,
+            args.splitter,
         )
+        if problem and answer:
+            rows.append({"question": str(problem), "answer": str(answer)})
+        if args.max_samples and len(rows) >= args.max_samples:
+            break
+    return rows
 
+
+def ground_truth_from_context(context: str):
+    boxes = braced_blocks(context)
+    if boxes:
+        return boxes[-1]
+    marker = "Given the ground truth answer is"
+    start = context.find(marker)
+    if start < 0:
+        return None
+    return context[start + len(marker) :].strip(" .\n\t")
+
+
+def get_prompts(row: dict) -> tuple[str, str, str, str | None]:
     question = row.get("question")
     answer = row.get("ground_truth", row.get("answer"))
     if not isinstance(question, str) or answer is None:
         raise ValueError(
             "Each row needs prompt/privileged_context or question/ground_truth."
         )
-    context = f"\nGiven the ground truth answer is $\\boxed{{{answer}}}."
+    context = f"\nGiven the ground truth answer is $\\boxed{{{answer}}}$."
     clean_prompt = f"{question} "
-    return clean_prompt, clean_prompt + context, context, row.get("response"), ""
+    return clean_prompt, clean_prompt + context, context, str(answer)
+
+
+def response_text(message: dict) -> str:
+    reasoning = message.get("reasoning_content")
+    content = message.get("content") or ""
+    if reasoning:
+        return f"<think>\n{reasoning.strip()}\n</think>\n{content}".strip()
+    return content.strip()
+
+
+def split_reasoning(text: str) -> tuple[str, str | None]:
+    match = re.search(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+    if not match:
+        return text.strip(), None
+    reasoning = match.group(1).strip()
+    content = (text[: match.start()] + text[match.end() :]).strip()
+    return content, reasoning or None
+
+
+def output_messages(clean_prompt: str, response: str, ground_truth: str | None) -> list[dict]:
+    content, reasoning = split_reasoning(response)
+    return [
+        {
+            "role": "user",
+            "content": clean_prompt,
+            "reasoning_content": None,
+            "ground_truth": ground_truth,
+        },
+        {
+            "role": "assistant",
+            "content": content,
+            "reasoning_content": reasoning,
+            "ground_truth": ground_truth,
+        },
+    ]
 
 
 def thinking_extra_body(enable_thinking: bool | None):
     if enable_thinking is False:
         return {"chat_template_kwargs": {"enable_thinking": False}}
     return None
+
+
+def message_field(message, name: str):
+    value = getattr(message, name, None)
+    if value is not None:
+        return value
+    return (getattr(message, "model_extra", None) or {}).get(name)
 
 
 async def complete(
@@ -119,7 +187,7 @@ async def complete(
     temperature: float,
     enable_thinking: bool | None,
     sampling: bool,
-) -> str:
+) -> dict:
     request = {
         "model": args.model,
         "messages": messages,
@@ -143,31 +211,18 @@ async def complete(
 
     result = await client.chat.completions.create(**request)
     message = result.choices[0].message
-    reasoning = getattr(message, "reasoning", None) or getattr(
-        message, "reasoning_content", None
-    ) or ""
-    content = message.content or ""
-    return (reasoning + content).strip()
+    reasoning = message_field(message, "reasoning") or message_field(
+        message, "reasoning_content"
+    )
 
-
-def parse_spans(text: str, response: str) -> list[str]:
-    start, end = text.find("["), text.rfind("]")
-    if start < 0 or end < start:
-        raise ValueError(f"Judge did not return a JSON array: {text[:300]!r}")
-    values = json.loads(text[start : end + 1])
-    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
-        raise ValueError("Judge output must be a JSON array of strings.")
-
-    spans = []
-    for value in values:
-        value = value.strip()
-        if not value:
-            continue
-        if value not in response:
-            raise ValueError(f"Judge returned text not copied from response: {value!r}")
-        if value not in spans:
-            spans.append(value)
-    return sorted(spans, key=response.find)
+    if not reasoning and "</think>" in message.content:
+        reasoning = message.content.split("</think>")[0].replace("<think>", "").strip()
+        content_without_thinking = message.content.split("</think>")[-1].strip()
+        message.content = content_without_thinking
+    return {
+        "content": message.content or "",
+        "reasoning_content": reasoning.strip() if reasoning else None,
+    }
 
 
 def parse_rewritten(text: str) -> str:
@@ -182,43 +237,16 @@ def parse_rewritten(text: str) -> str:
     return response
 
 
-async def judge(client, args, full_prompt: str, response: str) -> list[str]:
-    messages = [
-        {"role": "system", "content": JUDGE_PROMPT},
-        {
-            "role": "user",
-            "content": f"PROMPT WITH PRIVILEGED CONTEXT:\n{full_prompt}\n\nMODEL RESPONSE:\n{response}",
-        },
-    ]
-    last_error = None
-    for _ in range(args.judge_retries + 1):
-        try:
-            output = await complete(
-                client,
-                args,
-                messages,
-                args.judge_max_tokens,
-                temperature=0.0,
-                enable_thinking=False,
-                sampling=False,
-            )
-            return parse_spans(output, response)
-        except (ValueError, json.JSONDecodeError) as exc:
-            last_error = exc
-    raise ValueError(f"Could not parse judge output after retries: {last_error}")
-
-
-async def rephrase(client, args, clean_prompt, response, spans) -> str:
+async def rephrase(client, args, clean_prompt, response) -> str:
     messages = [
         {
             "role": "system",
-            "content": "You are a careful answer editor. Follow the user's exact output format.",
+            "content": REPHRASE_SYSTEM_PROMPT,
         },
         {
             "role": "user",
             "content": REPHRASE_PROMPT.format(
                 prompt=clean_prompt,
-                spans=json.dumps(spans, ensure_ascii=False),
                 response=response,
             ),
         },
@@ -232,59 +260,31 @@ async def rephrase(client, args, clean_prompt, response, spans) -> str:
         enable_thinking=False,
         sampling=False,
     )
-    return parse_rewritten(output)
-
-
-def output_row(row, full_prompt, context, response, generation_model, spans):
-    result = {
-        **row,
-        "generation_model": row.get("generation_model", generation_model),
-        "prompt": full_prompt,
-        "privileged_context": context,
-        "response": response,
-        "detected_leakage_spans": spans,
-    }
-    if "leakage_spans" not in row:
-        result["leakage_spans"] = spans
-    return result
+    return parse_rewritten(response_text(output))
 
 
 async def process_row(client, args, row):
-    clean_prompt, full_prompt, context, response, source_model = get_prompts(row)
-    generation_model = source_model or args.model
-    if not response:
-        response = await complete(
-            client,
-            args,
-            [{"role": "user", "content": full_prompt}],
-            args.max_new_tokens,
-            args.temperature,
-            enable_thinking=None if not args.disable_thinking else False,
-            sampling=True,
-        )
-
-    spans = await judge(client, args, full_prompt, response)
-    for _ in range(args.max_rounds):
-        if not spans:
-            break
-        rewritten = await rephrase(client, args, clean_prompt, response, spans)
-        if rewritten == response:
-            break
-        response = rewritten
-        spans = await judge(client, args, full_prompt, response)
-
-    return output_row(row, full_prompt, context, response, generation_model, spans)
+    clean_prompt, full_prompt, privileged_context, ground_truth = get_prompts(row)
+    generated = await complete(
+        client,
+        args,
+        [{"role": "user", "content": full_prompt}],
+        args.max_new_tokens,
+        args.temperature,
+        enable_thinking=None if not args.disable_thinking else False,
+        sampling=True,
+    )
+    response = response_text(generated)
+    response = await rephrase(client, args, clean_prompt, response)
+    return {"messages": output_messages(clean_prompt, response, ground_truth)}
 
 
 async def run(args):
     if args.max_concurrency < 1:
         raise ValueError("--max-concurrency must be >= 1.")
-    if args.max_rounds < 0:
-        raise ValueError("--max-rounds must be non-negative.")
 
-    rows = read_jsonl(args.input_path)
-    if args.max_samples is not None:
-        rows = rows[: args.max_samples]
+    rows = load_seed_examples(args)
+    print(f"Loaded {len(rows)} seed examples from {args.dataset}/{args.split}")
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     if args.overwrite and args.output_path.exists():
         args.output_path.unlink()
@@ -294,7 +294,7 @@ async def run(args):
     except ImportError as exc:
         raise ImportError("Install the OpenAI package with: pip install openai") from exc
 
-    client = AsyncOpenAI(base_url=args.base_url, api_key=args.api_key)
+    client = AsyncOpenAI(base_url=args.base_url, api_key=args.api_key, timeout=1500)
     semaphore = asyncio.Semaphore(args.max_concurrency)
 
     async def limited(row):
