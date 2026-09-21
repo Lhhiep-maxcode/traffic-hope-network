@@ -265,7 +265,7 @@ async def rephrase(client, args, clean_prompt, context, response) -> str:
         enable_thinking=False,
         sampling=False,
     )
-    return parse_rewritten(response_text(output))
+    return parse_rewritten(output["content"])
 
 
 async def process_row(client, args, row):
