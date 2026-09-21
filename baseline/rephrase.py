@@ -263,26 +263,29 @@ async def process_row(client, args, row):
     )
     content = generated['content']
     reasoning = generated['reasoning_content']
-    if content:
-        content = await rephrase(client, args, clean_prompt, privileged_context, content)
-    if reasoning:
-        reasoning = await rephrase(client, args, clean_prompt, privileged_context, reasoning)
-    return {
-        "messages": [
-            {
-                "role": "user",
-                "content": clean_prompt,
-            },
-            {
-                "role": "assistant",
-                "content": content,
-                "reasoning_content": reasoning,
-            },
-        ],
-        "privileged_context": privileged_context,
-        "ground_truth": ground_truth,
-        "domain": row.get("domain"),
-    }
+    try:
+        if content:
+            content = await rephrase(client, args, clean_prompt, privileged_context, content)
+        if reasoning:
+            reasoning = await rephrase(client, args, clean_prompt, privileged_context, reasoning)
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": clean_prompt,
+                },
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning,
+                },
+            ],
+            "privileged_context": privileged_context,
+            "ground_truth": ground_truth,
+            "domain": row.get("domain"),
+        }
+    except Exception as e:
+        return None
 
 
 async def run(args):
@@ -322,8 +325,9 @@ async def run(args):
                     ]
                     for task in asyncio.as_completed(tasks):
                         result = await task
-                        output.write(json.dumps(result, ensure_ascii=False) + "\n")
-                        output.flush()
+                        if result is not None:
+                            output.write(json.dumps(result, ensure_ascii=False) + "\n")
+                            output.flush()
                         progress.update(1)
     finally:
         await client.close()
