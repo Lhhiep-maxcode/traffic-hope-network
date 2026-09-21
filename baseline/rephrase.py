@@ -130,7 +130,7 @@ def get_prompts(row: dict) -> tuple[str, str, str, str | None]:
             "Each row needs prompt/privileged_context or question/ground_truth."
         )
     context = f"\nGiven the ground truth answer is $\\boxed{{{answer}}}$."
-    clean_prompt = f"{question} "
+    clean_prompt = f"{question}"
     return clean_prompt, clean_prompt + context, context, str(answer)
 
 
