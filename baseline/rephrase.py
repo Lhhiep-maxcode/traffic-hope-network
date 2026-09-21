@@ -97,6 +97,7 @@ def load_seed_examples(args) -> list[dict]:
     dataset = dataset.select(range(args.start_index, min(args.end_index, len(dataset))))
 
     rows = []
+    error = 0
     for example in dataset:
         problem = example.get(args.problem_field)
         answer = parse_answer(
@@ -108,9 +109,10 @@ def load_seed_examples(args) -> list[dict]:
         if problem and answer:
             rows.append({"question": str(problem), "answer": str(answer), "domain": example.get("domain")})
         else:
-            print(f"Skipping example with missing problem or answer: {example}")
+            error += 1
         if args.max_samples and len(rows) >= args.max_samples:
             break
+    print(f"Loaded {len(rows)} examples with {error} errors.")
     return rows
 
 
