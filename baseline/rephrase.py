@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--disable-thinking", action="store_true")
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -172,41 +173,42 @@ async def complete(
     enable_thinking: bool | None,
     sampling: bool,
 ) -> dict:
-    request = {
-        "model": args.model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }
-    if sampling:
-        request.update(
-            {
-                "temperature": temperature,
-                "top_p": args.top_p,
-            }
+    async with semaphore:
+        request = {
+            "model": args.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if sampling:
+            request.update(
+                {
+                    "temperature": temperature,
+                    "top_p": args.top_p,
+                }
+            )
+            if args.top_k > 0:
+                request["top_k"] = args.top_k
+        else:
+            request["temperature"] = 0.0
+
+        extra_body = thinking_extra_body(enable_thinking)
+        if extra_body:
+            request["extra_body"] = extra_body
+
+        result = await client.chat.completions.create(**request)
+        message = result.choices[0].message
+        content = message.content or ""
+        reasoning = message_field(message, "reasoning") or message_field(
+            message, "reasoning_content"
         )
-        if args.top_k > 0:
-            request["top_k"] = args.top_k
-    else:
-        request["temperature"] = 0.0
 
-    extra_body = thinking_extra_body(enable_thinking)
-    if extra_body:
-        request["extra_body"] = extra_body
-
-    result = await client.chat.completions.create(**request)
-    message = result.choices[0].message
-    content = message.content or ""
-    reasoning = message_field(message, "reasoning") or message_field(
-        message, "reasoning_content"
-    )
-
-    if not reasoning and "</think>" in content:
-        reasoning = content.split("</think>", 1)[0].replace("<think>", "").strip()
-        content = content.split("</think>", 1)[1].strip()
-    return {
-        "content": content,
-        "reasoning_content": reasoning.strip() if reasoning else None,
-    }
+        if not reasoning and "</think>" in content:
+            reasoning = content.split("</think>", 1)[0].replace("<think>", "").strip()
+            content = content.split("</think>", 1)[1].strip()
+        return {
+            "content": content,
+            "reasoning_content": reasoning.strip() if reasoning else None,
+        }
 
 
 def parse_rewritten(text: str) -> str:
@@ -249,44 +251,46 @@ async def rephrase(client, args, clean_prompt, context, response) -> str:
 
 
 async def process_row(client, args, row):
-    async with semaphore:
-        clean_prompt, full_prompt, privileged_context, ground_truth = get_prompts(row)
-        generated = await complete(
-            client,
-            args,
-            [{"role": "user", "content": full_prompt}],
-            args.max_new_tokens,
-            args.temperature,
-            enable_thinking=True if not args.disable_thinking else False,
-            sampling=True,
-        )
-        content = generated['content']
-        reasoning = generated['reasoning_content']
-        if content:
-            content = await rephrase(client, args, clean_prompt, privileged_context, content)
-        if reasoning:
-            reasoning = await rephrase(client, args, clean_prompt, privileged_context, reasoning)
-        return {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": clean_prompt,
-                },
-                {
-                    "role": "assistant",
-                    "content": content,
-                    "reasoning_content": reasoning,
-                },
-            ],
-            "privileged_context": privileged_context,
-            "ground_truth": ground_truth,
-            "domain": row.get("domain"),
-        }
+    clean_prompt, full_prompt, privileged_context, ground_truth = get_prompts(row)
+    generated = await complete(
+        client,
+        args,
+        [{"role": "user", "content": full_prompt}],
+        args.max_new_tokens,
+        args.temperature,
+        enable_thinking=True if not args.disable_thinking else False,
+        sampling=True,
+    )
+    content = generated['content']
+    reasoning = generated['reasoning_content']
+    if content:
+        content = await rephrase(client, args, clean_prompt, privileged_context, content)
+    if reasoning:
+        reasoning = await rephrase(client, args, clean_prompt, privileged_context, reasoning)
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": clean_prompt,
+            },
+            {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": reasoning,
+            },
+        ],
+        "privileged_context": privileged_context,
+        "ground_truth": ground_truth,
+        "domain": row.get("domain"),
+    }
 
 
 async def run(args):
     if args.max_concurrency < 1:
         raise ValueError("--max-concurrency must be >= 1.")
+    chunk_size = args.chunk_size or args.max_concurrency
+    if chunk_size < 1:
+        raise ValueError("--chunk-size must be >= 1.")
 
     rows = load_seed_examples(args)
     print(f"Loaded {len(rows)} seed examples from {args.dataset}/{args.split}")
@@ -307,17 +311,20 @@ async def run(args):
     global semaphore
     semaphore = asyncio.Semaphore(args.max_concurrency)
 
-    tasks = [asyncio.create_task(process_row(client, args, row)) for row in rows]
     try:
         with args.output_path.open("a", encoding="utf-8") as output:
-            for task in tqdm(
-                asyncio.as_completed(tasks),
-                total=len(tasks),
-                desc="Rephrasing",
-            ):
-                result = await task
-                output.write(json.dumps(result, ensure_ascii=False) + "\n")
-                output.flush()
+            with tqdm(total=len(rows), desc="Rephrasing") as progress:
+                for start in range(0, len(rows), chunk_size):
+                    chunk = rows[start : start + chunk_size]
+                    tasks = [
+                        asyncio.create_task(process_row(client, args, row))
+                        for row in chunk
+                    ]
+                    for task in asyncio.as_completed(tasks):
+                        result = await task
+                        output.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        output.flush()
+                        progress.update(1)
     finally:
         await client.close()
 
