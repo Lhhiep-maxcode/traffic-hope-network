@@ -15,8 +15,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.utils import read_jsonl
-
 try:
     from rephrase_prompt import REPHRASE_PROMPT, REPHRASE_SYSTEM_PROMPT
 except ImportError:
@@ -109,6 +107,23 @@ def load_seed_examples(args) -> list[dict]:
         if args.max_samples and len(rows) >= args.max_samples:
             break
     return rows
+
+
+def processed_questions(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    questions = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            content = row["messages"][0]["content"]
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+            continue
+        if isinstance(content, str):
+            questions.add(content.strip())
+    return questions
 
 
 def ground_truth_from_context(context: str):
@@ -300,10 +315,9 @@ async def run(args):
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     if args.overwrite and args.output_path.exists():
         args.output_path.unlink()
-    processed_item = read_jsonl(args.output_path) if args.output_path.exists() else []
-    processed_item = set([item['messages'][0]['content'] for item in processed_item])
-    rows = [row for row in rows if row['question'] not in processed_item]
-    print(f"Loaded {len(rows)} unprocessed examples from {args.dataset}/{args.split}. Continueing to rephrase...")
+    processed_item = processed_questions(args.output_path)
+    rows = [row for row in rows if row["question"].strip() not in processed_item]
+    print(f"Loaded {len(rows)} unprocessed examples from {args.dataset}/{args.split}. Continuing to rephrase...")
 
     try:
         from openai import AsyncOpenAI
