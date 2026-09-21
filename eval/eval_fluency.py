@@ -1,21 +1,34 @@
+from copy import deepcopy
+
 from datasets import load_dataset
 from openai import OpenAI
 from numpy import mean, exp
+from transformers import AutoTokenizer
 
 
-BASE_URL = ...
-API_KEY = ...
+BASE_URL = "http://localhost:8000/v1"
+API_KEY = "empty"
 MODEL_NAME = ...
 DATA_FILES = ...
 NUM_PROC = 64
 SAVE_DIR = ...
+TOKENIZER_PATH = ...
+
+
+tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
 
 
 def compute_logprob(example):
     client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+    
+    messages = deepcopy(example["messages"])
+    messages[-1]["content"] = ""
+    
+    text = tokenizer.apply_chat_template(messages, tokenize=False)
+    
     response = client.completions.create(
         model=MODEL_NAME,
-        prompt=example["text"],
+        prompt=text,
         max_tokens=1,
         logprobs=1,
         echo=True
