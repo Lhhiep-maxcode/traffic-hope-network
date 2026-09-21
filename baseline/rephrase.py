@@ -148,24 +148,6 @@ def split_reasoning(text: str) -> tuple[str, str | None]:
     return content, reasoning or None
 
 
-def output_messages(clean_prompt: str, response: str, ground_truth: str | None) -> list[dict]:
-    content, reasoning = split_reasoning(response)
-    return [
-        {
-            "role": "user",
-            "content": clean_prompt,
-            "reasoning_content": None,
-            "ground_truth": ground_truth,
-        },
-        {
-            "role": "assistant",
-            "content": content,
-            "reasoning_content": reasoning,
-            "ground_truth": ground_truth,
-        },
-    ]
-
-
 def thinking_extra_body(enable_thinking: bool | None):
     if enable_thinking is False:
         return {"chat_template_kwargs": {"enable_thinking": False}}
@@ -211,23 +193,23 @@ async def complete(
 
     result = await client.chat.completions.create(**request)
     message = result.choices[0].message
+    content = message.content or ""
     reasoning = message_field(message, "reasoning") or message_field(
         message, "reasoning_content"
     )
 
-    if not reasoning and "</think>" in message.content:
-        reasoning = message.content.split("</think>")[0].replace("<think>", "").strip()
-        content_without_thinking = message.content.split("</think>")[-1].strip()
-        message.content = content_without_thinking
+    if not reasoning and "</think>" in content:
+        reasoning = content.split("</think>", 1)[0].replace("<think>", "").strip()
+        content = content.split("</think>", 1)[1].strip()
     return {
-        "content": message.content or "",
+        "content": content,
         "reasoning_content": reasoning.strip() if reasoning else None,
     }
 
 
 def parse_rewritten(text: str) -> str:
-    marker = "<REWRITTEN_RESPONSE>"
-    end_marker = "</REWRITTEN_RESPONSE>"
+    marker = "<REWRITTEN_TEXT>"
+    end_marker = "</REWRITTEN_TEXT>"
     start, end = text.find(marker), text.rfind(end_marker)
     if start < 0 or end < start:
         raise ValueError("Model did not return the required rewrite tags.")
@@ -237,7 +219,7 @@ def parse_rewritten(text: str) -> str:
     return response
 
 
-async def rephrase(client, args, clean_prompt, response) -> str:
+async def rephrase(client, args, clean_prompt, context, response) -> str:
     messages = [
         {
             "role": "system",
@@ -247,6 +229,7 @@ async def rephrase(client, args, clean_prompt, response) -> str:
             "role": "user",
             "content": REPHRASE_PROMPT.format(
                 prompt=clean_prompt,
+                context=context,
                 response=response,
             ),
         },
@@ -271,12 +254,32 @@ async def process_row(client, args, row):
         [{"role": "user", "content": full_prompt}],
         args.max_new_tokens,
         args.temperature,
-        enable_thinking=None if not args.disable_thinking else False,
+        enable_thinking=True if not args.disable_thinking else False,
         sampling=True,
     )
-    response = response_text(generated)
-    response = await rephrase(client, args, clean_prompt, response)
-    return {"messages": output_messages(clean_prompt, response, ground_truth)}
+    content = generated['content']
+    reasoning = generated['reasoning_content']
+    if content:
+        content = await rephrase(client, args, clean_prompt, privileged_context, content)
+    if reasoning:
+        reasoning = await rephrase(client, args, clean_prompt, privileged_context, reasoning)
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": clean_prompt,
+                "reasoning_content": None,
+                "ground_truth": None,
+            },
+            {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": reasoning,
+                "ground_truth": ground_truth,
+            },
+        ],
+        "privileged_context": privileged_context,
+    }
 
 
 async def run(args):
