@@ -172,42 +172,41 @@ async def complete(
     enable_thinking: bool | None,
     sampling: bool,
 ) -> dict:
-    async with semaphore:
-        request = {
-            "model": args.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-        }
-        if sampling:
-            request.update(
-                {
-                    "temperature": temperature,
-                    "top_p": args.top_p,
-                }
-            )
-            if args.top_k > 0:
-                request["top_k"] = args.top_k
-        else:
-            request["temperature"] = 0.0
-
-        extra_body = thinking_extra_body(enable_thinking)
-        if extra_body:
-            request["extra_body"] = extra_body
-
-        result = await client.chat.completions.create(**request)
-        message = result.choices[0].message
-        content = message.content or ""
-        reasoning = message_field(message, "reasoning") or message_field(
-            message, "reasoning_content"
+    request = {
+        "model": args.model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    if sampling:
+        request.update(
+            {
+                "temperature": temperature,
+                "top_p": args.top_p,
+            }
         )
+        if args.top_k > 0:
+            request["top_k"] = args.top_k
+    else:
+        request["temperature"] = 0.0
 
-        if not reasoning and "</think>" in content:
-            reasoning = content.split("</think>", 1)[0].replace("<think>", "").strip()
-            content = content.split("</think>", 1)[1].strip()
-        return {
-            "content": content,
-            "reasoning_content": reasoning.strip() if reasoning else None,
-        }
+    extra_body = thinking_extra_body(enable_thinking)
+    if extra_body:
+        request["extra_body"] = extra_body
+
+    result = await client.chat.completions.create(**request)
+    message = result.choices[0].message
+    content = message.content or ""
+    reasoning = message_field(message, "reasoning") or message_field(
+        message, "reasoning_content"
+    )
+
+    if not reasoning and "</think>" in content:
+        reasoning = content.split("</think>", 1)[0].replace("<think>", "").strip()
+        content = content.split("</think>", 1)[1].strip()
+    return {
+        "content": content,
+        "reasoning_content": reasoning.strip() if reasoning else None,
+    }
 
 
 def parse_rewritten(text: str) -> str:
@@ -250,38 +249,39 @@ async def rephrase(client, args, clean_prompt, context, response) -> str:
 
 
 async def process_row(client, args, row):
-    clean_prompt, full_prompt, privileged_context, ground_truth = get_prompts(row)
-    generated = await complete(
-        client,
-        args,
-        [{"role": "user", "content": full_prompt}],
-        args.max_new_tokens,
-        args.temperature,
-        enable_thinking=True if not args.disable_thinking else False,
-        sampling=True,
-    )
-    content = generated['content']
-    reasoning = generated['reasoning_content']
-    if content:
-        content = await rephrase(client, args, clean_prompt, privileged_context, content)
-    if reasoning:
-        reasoning = await rephrase(client, args, clean_prompt, privileged_context, reasoning)
-    return {
-        "messages": [
-            {
-                "role": "user",
-                "content": clean_prompt,
-            },
-            {
-                "role": "assistant",
-                "content": content,
-                "reasoning_content": reasoning,
-            },
-        ],
-        "privileged_context": privileged_context,
-        "ground_truth": ground_truth,
-        "domain": row.get("domain"),
-    }
+    async with semaphore:
+        clean_prompt, full_prompt, privileged_context, ground_truth = get_prompts(row)
+        generated = await complete(
+            client,
+            args,
+            [{"role": "user", "content": full_prompt}],
+            args.max_new_tokens,
+            args.temperature,
+            enable_thinking=True if not args.disable_thinking else False,
+            sampling=True,
+        )
+        content = generated['content']
+        reasoning = generated['reasoning_content']
+        if content:
+            content = await rephrase(client, args, clean_prompt, privileged_context, content)
+        if reasoning:
+            reasoning = await rephrase(client, args, clean_prompt, privileged_context, reasoning)
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": clean_prompt,
+                },
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning,
+                },
+            ],
+            "privileged_context": privileged_context,
+            "ground_truth": ground_truth,
+            "domain": row.get("domain"),
+        }
 
 
 async def run(args):
