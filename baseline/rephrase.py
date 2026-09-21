@@ -11,11 +11,11 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 
-from utils.utils import read_jsonl
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from utils.utils import read_jsonl
 
 try:
     from rephrase_prompt import REPHRASE_PROMPT, REPHRASE_SYSTEM_PROMPT
@@ -270,17 +270,16 @@ async def process_row(client, args, row):
             {
                 "role": "user",
                 "content": clean_prompt,
-                "reasoning_content": None,
-                "ground_truth": None,
             },
             {
                 "role": "assistant",
                 "content": content,
                 "reasoning_content": reasoning,
-                "ground_truth": ground_truth,
             },
         ],
         "privileged_context": privileged_context,
+        "ground_truth": ground_truth,
+        "domain": row.get("domain"),
     }
 
 
