@@ -94,7 +94,7 @@ def load_seed_examples(args) -> list[dict]:
     if args.dataset_config:
         dataset_args.append(args.dataset_config)
     dataset = load_dataset(*dataset_args, split=args.split).shuffle(seed=42)
-    dataset = dataset.select(range(args.start_index, args.end_index))
+    dataset = dataset.select(range(args.start_index, min(args.end_index, len(dataset))))
 
     rows = []
     for example in dataset:
@@ -107,6 +107,8 @@ def load_seed_examples(args) -> list[dict]:
         )
         if problem and answer:
             rows.append({"question": str(problem), "answer": str(answer), "domain": example.get("domain")})
+        else:
+            print(f"Skipping example with missing problem or answer: {example}")
         if args.max_samples and len(rows) >= args.max_samples:
             break
     return rows
