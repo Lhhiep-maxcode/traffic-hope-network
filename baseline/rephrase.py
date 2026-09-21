@@ -172,41 +172,42 @@ async def complete(
     enable_thinking: bool | None,
     sampling: bool,
 ) -> dict:
-    request = {
-        "model": args.model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }
-    if sampling:
-        request.update(
-            {
-                "temperature": temperature,
-                "top_p": args.top_p,
-            }
+    async with semaphore:
+        request = {
+            "model": args.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if sampling:
+            request.update(
+                {
+                    "temperature": temperature,
+                    "top_p": args.top_p,
+                }
+            )
+            if args.top_k > 0:
+                request["top_k"] = args.top_k
+        else:
+            request["temperature"] = 0.0
+
+        extra_body = thinking_extra_body(enable_thinking)
+        if extra_body:
+            request["extra_body"] = extra_body
+
+        result = await client.chat.completions.create(**request)
+        message = result.choices[0].message
+        content = message.content or ""
+        reasoning = message_field(message, "reasoning") or message_field(
+            message, "reasoning_content"
         )
-        if args.top_k > 0:
-            request["top_k"] = args.top_k
-    else:
-        request["temperature"] = 0.0
 
-    extra_body = thinking_extra_body(enable_thinking)
-    if extra_body:
-        request["extra_body"] = extra_body
-
-    result = await client.chat.completions.create(**request)
-    message = result.choices[0].message
-    content = message.content or ""
-    reasoning = message_field(message, "reasoning") or message_field(
-        message, "reasoning_content"
-    )
-
-    if not reasoning and "</think>" in content:
-        reasoning = content.split("</think>", 1)[0].replace("<think>", "").strip()
-        content = content.split("</think>", 1)[1].strip()
-    return {
-        "content": content,
-        "reasoning_content": reasoning.strip() if reasoning else None,
-    }
+        if not reasoning and "</think>" in content:
+            reasoning = content.split("</think>", 1)[0].replace("<think>", "").strip()
+            content = content.split("</think>", 1)[1].strip()
+        return {
+            "content": content,
+            "reasoning_content": reasoning.strip() if reasoning else None,
+        }
 
 
 def parse_rewritten(text: str) -> str:
@@ -303,13 +304,10 @@ async def run(args):
         raise ImportError("Install the OpenAI package with: pip install openai") from exc
 
     client = AsyncOpenAI(base_url=args.base_url, api_key=args.api_key, timeout=1500)
+    global semaphore
     semaphore = asyncio.Semaphore(args.max_concurrency)
 
-    async def limited(row):
-        async with semaphore:
-            return await process_row(client, args, row)
-
-    tasks = [asyncio.create_task(limited(row)) for row in rows]
+    tasks = [asyncio.create_task(process_row(client, args, row)) for row in rows]
     try:
         with args.output_path.open("a", encoding="utf-8") as output:
             for task in tqdm(
