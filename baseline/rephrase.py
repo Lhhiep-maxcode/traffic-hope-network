@@ -11,6 +11,8 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 
+from utils.utils import read_jsonl
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -291,6 +293,10 @@ async def run(args):
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     if args.overwrite and args.output_path.exists():
         args.output_path.unlink()
+    processed_item = read_jsonl(args.output_path) if args.output_path.exists() else []
+    processed_item = set([item['messages'][0]['content'] for item in processed_item])
+    rows = [row for row in rows if row['question'] not in processed_item]
+    print(f"Loaded {len(rows)} unprocessed examples from {args.dataset}/{args.split}. Continueing to rephrase...")
 
     try:
         from openai import AsyncOpenAI
