@@ -52,5 +52,5 @@ def main():
     ds_ppl.to_json(SAVE_DIR, force_ascii=False, lines=True)
     
     print(f"Outputs saved at {SAVE_DIR}")
-    print(f"score={score:4f}")
+    print(f"Fluency PPL = {score:4f}")
 
