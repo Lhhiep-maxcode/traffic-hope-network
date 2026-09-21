@@ -298,6 +298,7 @@ async def process_row(client, args, row):
                     "reasoning_content": reasoning,
                 },
             ],
+            "original_reasoning_content": generated['reasoning_content'],
             "privileged_context": privileged_context,
             "ground_truth": ground_truth,
             "domain": row.get("domain"),
