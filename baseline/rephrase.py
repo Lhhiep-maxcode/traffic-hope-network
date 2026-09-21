@@ -105,7 +105,7 @@ def load_seed_examples(args) -> list[dict]:
             args.splitter,
         )
         if problem and answer:
-            rows.append({"question": str(problem), "answer": str(answer)})
+            rows.append({"question": str(problem), "answer": str(answer), "domain": example.get("domain")})
         if args.max_samples and len(rows) >= args.max_samples:
             break
     return rows
