@@ -34,6 +34,8 @@ def parse_args():
     parser.add_argument("--problem-field", default="question")
     parser.add_argument("--solution-field", default="solution")
     parser.add_argument("--answer-field", default="ground_truth")
+    parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--end-index", type=int, default=10000000000)
     parser.add_argument("--splitter", default=None)
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     parser.add_argument("--api-key", default="EMPTY")
@@ -92,6 +94,7 @@ def load_seed_examples(args) -> list[dict]:
     if args.dataset_config:
         dataset_args.append(args.dataset_config)
     dataset = load_dataset(*dataset_args, split=args.split).shuffle(seed=42)
+    dataset = dataset.select(range(args.start_index, args.end_index))
 
     rows = []
     for example in dataset:
