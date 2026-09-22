@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--plot-dir", type=Path, default=output / "lowest_score_plots")
     parser.add_argument("--plot-lowest-n", type=int, default=0)
     parser.add_argument("--aggregation", choices=["weighted", "mean"], default="weighted")
+    parser.add_argument("--threshold-tuning", action="store_true")
     parser.add_argument("--threshold-steps", type=int, default=200)
     parser.add_argument("--min-span-recall", type=float, default=0.9)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -236,8 +237,14 @@ def evaluate(model, tokenizer, args):
         del batch_attn
         clear_memory()
 
-    best = choose_threshold(records, args)
-    threshold = best["threshold"]
+    if args.threshold_tuning:
+        best = choose_threshold(records, args)
+        threshold = best["threshold"]
+    else:
+        if detector.get("threshold") is None:
+            raise ValueError("No saved threshold found. Run with --threshold-tuning first.")
+        threshold = float(detector["threshold"])
+        best = pooled_threshold_metrics(records, threshold)
 
     for rank, record in enumerate(sorted(records, key=lambda row: row["score"])[: args.plot_lowest_n], 1):
         stats, pred = metric_row(record["real"], record["ideal"], threshold)
