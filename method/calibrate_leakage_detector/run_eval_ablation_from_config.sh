@@ -12,8 +12,19 @@ AGGREGATION="${AGGREGATION:-weighted}"
 MIN_SPAN_RECALL="${MIN_SPAN_RECALL:-0.9}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-8192}"
+NUM_SHARDS="${NUM_SHARDS:-1}"
+SHARD_INDEX="${SHARD_INDEX:-0}"
 
 cd "${REPO_ROOT}"
+
+if (( NUM_SHARDS < 1 )); then
+  echo "NUM_SHARDS must be >= 1." >&2
+  exit 1
+fi
+if (( SHARD_INDEX < 0 || SHARD_INDEX >= NUM_SHARDS )); then
+  echo "SHARD_INDEX must satisfy 0 <= SHARD_INDEX < NUM_SHARDS." >&2
+  exit 1
+fi
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
   echo "Config not found: ${CONFIG_PATH}" >&2
@@ -36,6 +47,20 @@ PY
 if [[ "$#" -gt 0 ]]; then
   CONFIG_KEYS=("$@")
 fi
+
+if (( NUM_SHARDS > 1 )); then
+  TOTAL_KEYS="${#CONFIG_KEYS[@]}"
+  CHUNK_SIZE=$(( (TOTAL_KEYS + NUM_SHARDS - 1) / NUM_SHARDS ))
+  START=$(( SHARD_INDEX * CHUNK_SIZE ))
+  END=$(( START + CHUNK_SIZE ))
+  if (( END > TOTAL_KEYS )); then
+    END="${TOTAL_KEYS}"
+  fi
+  COUNT=$(( END > START ? END - START : 0 ))
+  CONFIG_KEYS=("${CONFIG_KEYS[@]:START:COUNT}")
+fi
+
+echo "Shard ${SHARD_INDEX}/${NUM_SHARDS}: ${#CONFIG_KEYS[@]} config(s)"
 
 split_key() {
   local key="$1"
