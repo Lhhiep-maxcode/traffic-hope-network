@@ -5,6 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 CONFIG_PATH="${CONFIG_PATH:-${SCRIPT_DIR}/output/detector_config_ablation.json}"
+CONFIG_NAME="$(basename "${CONFIG_PATH}")"
+COMPLETED_PATH="${COMPLETED_PATH:-${SCRIPT_DIR}/output/${CONFIG_NAME%.json}_completed.txt}"
+RESUME="${RESUME:-1}"
 MODELS_ROOT="${MODELS_ROOT:-/workspace/storage-shared/nlp/hieplh8/model}"
 GPUS="${GPUS:-0,1,2,3}"
 PLOT_LOWEST_N="${PLOT_LOWEST_N:-200}"
@@ -30,6 +33,8 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
   echo "Config not found: ${CONFIG_PATH}" >&2
   exit 1
 fi
+mkdir -p "$(dirname "${COMPLETED_PATH}")"
+touch "${COMPLETED_PATH}"
 
 mapfile -t CONFIG_KEYS < <(
   python3 - "${CONFIG_PATH}" <<'PY'
@@ -61,6 +66,7 @@ if (( NUM_SHARDS > 1 )); then
 fi
 
 echo "Shard ${SHARD_INDEX}/${NUM_SHARDS}: ${#CONFIG_KEYS[@]} config(s)"
+echo "Completed ledger: ${COMPLETED_PATH}"
 
 split_key() {
   local key="$1"
@@ -87,6 +93,11 @@ split_key() {
 }
 
 for MODEL_KEY in "${CONFIG_KEYS[@]}"; do
+  if [[ "${RESUME}" == "1" ]] && grep -Fxq "${MODEL_KEY}" "${COMPLETED_PATH}"; then
+    echo "Skipping ${MODEL_KEY}: already completed."
+    continue
+  fi
+
   split_key "${MODEL_KEY}"
 
   MODEL_PATH="${MODELS_ROOT}/${MODEL_NAME}"
@@ -127,4 +138,7 @@ for MODEL_KEY in "${CONFIG_KEYS[@]}"; do
     --min-span-recall "${MIN_SPAN_RECALL}" \
     --batch-size "${BATCH_SIZE}" \
     --max-seq-len "${RUN_MAX_SEQ_LEN}"
+
+  echo "${MODEL_KEY}" >> "${COMPLETED_PATH}"
+  echo "Completed ${MODEL_KEY}"
 done
