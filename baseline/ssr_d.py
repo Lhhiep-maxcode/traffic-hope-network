@@ -306,6 +306,13 @@ async def generate_reasoning(client, args, semaphore, conversation):
     )
 
 
+def reasoning_prefill_content(reasoning: str) -> str:
+    reasoning = reasoning.strip()
+    if "<think" in reasoning and "</think>" in reasoning:
+        return f"{reasoning}\n{FINAL_ANSWER_PREFILL}"
+    return f"<think>\n{reasoning}\n</think>\n{FINAL_ANSWER_PREFILL}"
+
+
 def build_final_answer_prompt(tokenizer, question, reasoning):
     messages = [
         {"role": "user", "content": question},
@@ -323,8 +330,14 @@ def build_final_answer_prompt(tokenizer, question, reasoning):
         enable_thinking=False,
     )
     if reasoning not in prompt_with_prefill:
-        raise ValueError(
-            "The tokenizer chat template did not render assistant reasoning_content."
+        messages[-1].pop("reasoning_content")
+        messages[-1]["content"] = reasoning_prefill_content(reasoning)
+        prompt_with_prefill = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            continue_final_message="content",
+            enable_thinking=False,
         )
     prefill_start = prompt_with_prefill.rfind(FINAL_ANSWER_PREFILL)
     if prefill_start < 0:
