@@ -63,11 +63,19 @@ SKELETON_RE = re.compile(
 )
 REASON_RE = re.compile(r"<reason>\s*(.*?)\s*</reason>", re.IGNORECASE | re.DOTALL)
 
+SSR_RETRY_SUFFIX = """Your previous response could not be parsed. Follow the required format exactly: output one complete `<skeleton>...</skeleton>` block followed by one complete `<reason>...</reason>` block, with no other blocks or commentary."""
+FINAL_ANSWER_PREFILL = "__FINAL_ANSWER_PREFILL_8F9A3C__"
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-path", type=Path, required=True)
     parser.add_argument("--model", required=True, help="Model name served by vLLM.")
+    parser.add_argument(
+        "--tokenizer",
+        required=True,
+        help="Local tokenizer path or Hugging Face tokenizer name.",
+    )
     parser.add_argument("--dataset", default="Hiepppp/reasoning")
     parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--split", default="train")
@@ -84,6 +92,12 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--top-k", type=int, default=0)
+    parser.add_argument(
+        "--parse-retries",
+        type=int,
+        default=3,
+        help="Additional generation attempts after an SSR parse failure.",
+    )
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
@@ -222,18 +236,33 @@ def message_field(message, name: str):
     return (getattr(message, "model_extra", None) or {}).get(name)
 
 
-async def complete(client, args, semaphore, messages: list[dict]) -> str:
+async def complete(
+    client,
+    args,
+    semaphore,
+    messages: list[dict],
+    *,
+    temperature: float | None = None,
+    enable_thinking: bool | None = None,
+) -> str:
+    if temperature is None:
+        temperature = args.temperature
+    if enable_thinking is None:
+        enable_thinking = args.enable_thinking
     request = {
         "model": args.model,
         "messages": messages,
         "max_tokens": args.max_new_tokens,
-        "temperature": args.temperature,
+        "temperature": temperature,
         "top_p": args.top_p,
     }
+    extra_body = {}
     if args.top_k > 0:
-        request["top_k"] = args.top_k
-    if not args.enable_thinking:
-        request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        extra_body["top_k"] = args.top_k
+    if not enable_thinking:
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    if extra_body:
+        request["extra_body"] = extra_body
 
     async with semaphore:
         result = await client.chat.completions.create(**request)
@@ -249,33 +278,101 @@ async def complete(client, args, semaphore, messages: list[dict]) -> str:
     raise ValueError("Model returned no text.")
 
 
-async def process_row(client, args, semaphore, row):
-    clean_prompt, conversation, privileged_context, ground_truth = get_prompts(row)
-    raw_output = await complete(
-        client,
-        args,
-        semaphore,
-        [
-            {"role": "system", "content": SSR_SYSTEM_PROMPT},
-            {"role": "user", "content": conversation},
-        ],
+async def generate_reasoning(client, args, semaphore, conversation):
+    last_error = None
+    for attempt in range(args.parse_retries + 1):
+        system_prompt = SSR_SYSTEM_PROMPT
+        if attempt:
+            system_prompt = f"{system_prompt}\n\n{SSR_RETRY_SUFFIX}"
+        raw_output = await complete(
+            client,
+            args,
+            semaphore,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": conversation},
+            ],
+        )
+        try:
+            reasoning_content, skeleton, reason = parse_ssr_output(raw_output)
+        except ValueError as exc:
+            last_error = exc
+            continue
+        return raw_output, reasoning_content, skeleton, reason, attempt + 1
+
+    attempts = args.parse_retries + 1
+    raise ValueError(
+        f"Failed to parse SSR output after {attempts} attempts: {last_error}"
     )
-    reasoning_content, skeleton, reason = parse_ssr_output(raw_output)
+
+
+def build_final_answer_prompt(tokenizer, question, reasoning):
+    messages = [
+        {"role": "user", "content": question},
+        {
+            "role": "assistant",
+            "reasoning_content": reasoning,
+            "content": FINAL_ANSWER_PREFILL,
+        },
+    ]
+    prompt_with_prefill = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        continue_final_message="content",
+        enable_thinking=False,
+    )
+    if reasoning not in prompt_with_prefill:
+        raise ValueError(
+            "The tokenizer chat template did not render assistant reasoning_content."
+        )
+    prefill_start = prompt_with_prefill.rfind(FINAL_ANSWER_PREFILL)
+    if prefill_start < 0:
+        raise ValueError(
+            "The tokenizer chat template did not preserve the final-answer prefill."
+        )
+    return prompt_with_prefill[:prefill_start]
+
+
+async def generate_final_answer(
+    client, args, semaphore, tokenizer, question, reasoning
+):
+    prompt = build_final_answer_prompt(tokenizer, question, reasoning)
+    request = {
+        "model": args.model,
+        "prompt": prompt,
+        "max_tokens": args.max_new_tokens,
+        "temperature": 0.0,
+        "top_p": args.top_p,
+    }
+    if args.top_k > 0:
+        request["extra_body"] = {"top_k": args.top_k}
+
+    async with semaphore:
+        result = await client.completions.create(**request)
+    answer = (result.choices[0].text or "").strip()
+    if not answer:
+        raise ValueError("Model returned no final answer.")
+    return answer
+
+
+async def process_row(client, args, semaphore, tokenizer, row):
+    clean_prompt, conversation, _, _ = get_prompts(row)
+    _, reasoning_content, _, _, _ = await generate_reasoning(
+        client, args, semaphore, conversation
+    )
+    final_answer = await generate_final_answer(
+        client, args, semaphore, tokenizer, clean_prompt, reasoning_content
+    )
     return {
         "messages": [
             {"role": "user", "content": clean_prompt},
             {
                 "role": "assistant",
-                "content": ground_truth,
+                "content": final_answer,
                 "reasoning_content": reasoning_content,
             },
-        ],
-        "original_reasoning_content": raw_output,
-        "skeleton": skeleton,
-        "reason": reason,
-        "privileged_context": privileged_context,
-        "ground_truth": ground_truth,
-        "domain": row.get("domain"),
+        ]
     }
 
 
@@ -285,6 +382,8 @@ async def run(args):
     chunk_size = args.chunk_size or args.max_concurrency
     if chunk_size < 1:
         raise ValueError("--chunk-size must be >= 1.")
+    if args.parse_retries < 0:
+        raise ValueError("--parse-retries must be >= 0.")
 
     rows = load_seed_examples(args)
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -299,6 +398,14 @@ async def run(args):
     except ImportError as exc:
         raise ImportError("Install the OpenAI package with: pip install openai") from exc
 
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise ImportError(
+            "Install Transformers with: pip install transformers"
+        ) from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     client = AsyncOpenAI(base_url=args.base_url, api_key=args.api_key, timeout=1500)
     semaphore = asyncio.Semaphore(args.max_concurrency)
     failures = 0
@@ -308,7 +415,9 @@ async def run(args):
                 for start in range(0, len(rows), chunk_size):
                     chunk = rows[start : start + chunk_size]
                     tasks = [
-                        asyncio.create_task(process_row(client, args, semaphore, row))
+                        asyncio.create_task(
+                            process_row(client, args, semaphore, tokenizer, row)
+                        )
                         for row in chunk
                     ]
                     for task in asyncio.as_completed(tasks):
