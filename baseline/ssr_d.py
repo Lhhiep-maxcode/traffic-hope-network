@@ -280,23 +280,23 @@ async def complete(
 
 async def generate_reasoning(client, args, semaphore, conversation):
     last_error = None
+    messages = [
+        {"role": "system", "content": SSR_SYSTEM_PROMPT},
+        {"role": "user", "content": conversation},
+    ]
     for attempt in range(args.parse_retries + 1):
-        system_prompt = SSR_SYSTEM_PROMPT
-        if attempt:
-            system_prompt = f"{system_prompt}\n\n{SSR_RETRY_SUFFIX}"
-        raw_output = await complete(
-            client,
-            args,
-            semaphore,
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": conversation},
-            ],
-        )
+        raw_output = await complete(client, args, semaphore, messages)
         try:
             reasoning_content, skeleton, reason = parse_ssr_output(raw_output)
         except ValueError as exc:
             last_error = exc
+            messages = messages + [
+                {"role": "assistant", "content": raw_output},
+                {
+                    "role": "user",
+                    "content": f"{SSR_RETRY_SUFFIX}\nParser error: {exc}",
+                },
+            ]
             continue
         return raw_output, reasoning_content, skeleton, reason, attempt + 1
 
@@ -358,7 +358,7 @@ async def generate_final_answer(
 
 async def process_row(client, args, semaphore, tokenizer, row):
     clean_prompt, conversation, _, _ = get_prompts(row)
-    _, reasoning_content, _, _, _ = await generate_reasoning(
+    _, _, _, reasoning_content, _ = await generate_reasoning(
         client, args, semaphore, conversation
     )
     final_answer = await generate_final_answer(

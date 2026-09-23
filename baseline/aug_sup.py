@@ -232,23 +232,23 @@ async def complete(
 
 async def generate_reasoning(client, args, semaphore, full_prompt):
     last_error = None
+    messages = [
+        {"role": "system", "content": AUG_SUP_SYSTEM_PROMPT},
+        {"role": "user", "content": full_prompt},
+    ]
     for attempt in range(args.parse_retries + 1):
-        system_prompt = AUG_SUP_SYSTEM_PROMPT
-        if attempt:
-            system_prompt = f"{system_prompt}\n\n{AUG_SUP_RETRY_SUFFIX}"
-        raw_output = await complete(
-            client,
-            args,
-            semaphore,
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": full_prompt},
-            ],
-        )
+        raw_output = await complete(client, args, semaphore, messages)
         try:
             _, explanation = parse_aug_sup_output(raw_output)
         except ValueError as exc:
             last_error = exc
+            messages = messages + [
+                {"role": "assistant", "content": raw_output},
+                {
+                    "role": "user",
+                    "content": f"{AUG_SUP_RETRY_SUFFIX}\nParser error: {exc}",
+                },
+            ]
             continue
         return raw_output, explanation, attempt + 1
 
