@@ -20,6 +20,7 @@ from utils.utils import build_prompt, load_model_and_tokenizer, read_json, read_
 
 EPS = 1e-12
 PRIVILEGED_MARKER = "Given the ground truth answer is "
+SCORE_METHOD = "leakage_cosine_or_non_leak_top5_penalty"
 
 
 def parse_args():
@@ -37,7 +38,7 @@ def parse_args():
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--top-k-values", default=None)
     parser.add_argument("--window-sizes", default="1,3,5,7")
-    parser.add_argument("--threshold-steps", type=int, default=80)
+    parser.add_argument("--threshold-steps", type=int, default=80, help=argparse.SUPPRESS)
     parser.add_argument("--aggregation", choices=["weighted", "mean"], default="weighted")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -140,8 +141,8 @@ def build_inference_sample(row: dict, tokenizer, args) -> dict | None:
 
 
 def build_sample(row: dict, tokenizer, args) -> dict | None:
-    if not row.get("leakage_spans"):
-        return None
+    # if not row.get("leakage_spans"):
+    #     return None
     sample = build_inference_sample(row, tokenizer, args)
     if sample is None:
         return None
@@ -154,8 +155,8 @@ def build_sample(row: dict, tokenizer, args) -> dict | None:
                 if token_idx >= sample["prompt_len"]:
                     ideal[token_idx - sample["prompt_len"]] = 1.0
 
-    if ideal.sum() == 0:
-        raise RuntimeError(f"No leakage tokens found in sample: {row['prompt'][:80]}")
+    # if ideal.sum() == 0:
+    #     raise RuntimeError(f"No leakage tokens found in sample: {row['prompt'][:80]}")
     return {**sample, "ideal": ideal}
 
 
@@ -181,7 +182,7 @@ def get_batch_attention_weights(model, tokenizer, samples: list[dict]):
         seq_len = len(sample["input_ids"])
         input_ids[i, :seq_len] = sample["input_ids"]
         attention_mask[i, :seq_len] = 1
-
+    
     with torch.inference_mode():
         output = model(
             input_ids=input_ids.to(model_device(model)),
@@ -204,7 +205,7 @@ def attention_to_context(attentions, prompt_len: int, key_tokens: list[int]) -> 
     return torch.stack([
         layer_attn[0, :, prompt_len:, :].index_select(-1, key_tokens).sum(dim=-1)
         for layer_attn in attentions
-    ])
+    ])  # shape = (num_layers, num_heads, seq_len - prompt_len)
 
 
 def positive_median_normalize(values: torch.Tensor) -> torch.Tensor:
@@ -215,13 +216,22 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a * b).sum(dim=-1) / (a.norm(dim=-1) * b.norm()).clamp_min(EPS)
 
 
+def topk_mean(values: torch.Tensor, k: int = 5) -> torch.Tensor:
+    if values.shape[-1] == 0:
+        return torch.zeros(values.shape[:-1], dtype=values.dtype, device=values.device)
+    k = min(k, values.shape[-1])
+    return values.topk(k, dim=-1).values.mean(dim=-1)
+
+
+def leakage_shape_score(real: torch.Tensor, ideal: torch.Tensor) -> torch.Tensor:
+    if bool(ideal.bool().any()):
+        return cosine(real, ideal)
+    return -topk_mean(real)
+
+
 def head_scores(attentions, sample: dict) -> torch.Tensor:
     raw = attention_to_context(attentions, sample["prompt_len"], sample["key_tokens"])
-    gold = sample["ideal"].bool()
-    shape = cosine(positive_median_normalize(raw), sample["ideal"])
-    pos = raw[..., gold].mean(dim=-1)
-    neg = raw[..., ~gold].mean(dim=-1) if (~gold).any() else torch.zeros_like(pos)
-    return shape * (pos - neg).clamp_min(0)
+    return leakage_shape_score(raw, sample["ideal"])  # shape = (num_layers, num_heads)
 
 
 def top_heads(scores: torch.Tensor, top_k: int) -> list[dict]:
@@ -243,7 +253,7 @@ def aggregate_normalized_vectors(vectors: torch.Tensor, heads: list[dict], aggre
 
 def aggregate_selected_heads(attentions, sample: dict, heads: list[dict], aggregation: str = "weighted") -> torch.Tensor:
     raw = attention_to_context(attentions, sample["prompt_len"], sample["key_tokens"])
-    return aggregate_normalized_vectors(positive_median_normalize(raw), heads, aggregation)
+    return aggregate_normalized_vectors(raw, heads, aggregation)
 
 
 def rolling_max(values: torch.Tensor, window_size: int) -> torch.Tensor:
@@ -269,112 +279,48 @@ def token_spans(mask: torch.Tensor) -> list[dict]:
     return spans
 
 
-def metric_row(real: torch.Tensor, ideal: torch.Tensor, threshold: float) -> tuple[dict, torch.Tensor]:
-    pred, gold = real >= threshold, ideal.bool()
-    gold_spans = token_spans(gold)
-    pred_spans = token_spans(pred)
-    gold_starts = [span["start_token"] for span in gold_spans]
 
-    detected_gold_spans = sum(int(bool(pred[start])) for start in gold_starts)
-    correct_pred_spans = sum(
-        int(any(span["start_token"] <= start < span["end_token"] for start in gold_starts))
-        for span in pred_spans
-    )
-    missed_gold_spans = len(gold_spans) - detected_gold_spans
-    false_pred_spans = len(pred_spans) - correct_pred_spans
-    correct_pred_tokens = int((pred & gold).sum())
-    predicted_tokens = int(pred.sum())
-
-    return {
-        "detected_gold_spans": detected_gold_spans,
-        "missed_gold_spans": missed_gold_spans,
-        "total_gold_spans": len(gold_spans),
-        "correct_pred_spans": correct_pred_spans,
-        "false_pred_spans": false_pred_spans,
-        "total_pred_spans": len(pred_spans),
-        "correct_pred_tokens": correct_pred_tokens,
-        "predicted_tokens": predicted_tokens,
-        "precision": correct_pred_spans / max(len(pred_spans), 1),
-        "recall": detected_gold_spans / max(len(gold_spans), 1),
-        "full_recall": float(detected_gold_spans == len(gold_spans)),
-    }, pred
-
-
-def pooled_metrics(records: list[dict], window_size: int, threshold: float) -> dict:
-    total = {
-        "detected_gold_spans": 0,
-        "missed_gold_spans": 0,
-        "correct_pred_spans": 0,
-        "false_pred_spans": 0,
-        "correct_pred_tokens": 0,
-        "predicted_tokens": 0,
-        "full_hits": 0,
-    }
-    for record in records:
-        stats, _ = metric_row(rolling_max(record["real"], window_size), record["ideal"], threshold)
-        total["detected_gold_spans"] += stats["detected_gold_spans"]
-        total["missed_gold_spans"] += stats["missed_gold_spans"]
-        total["correct_pred_spans"] += stats["correct_pred_spans"]
-        total["false_pred_spans"] += stats["false_pred_spans"]
-        total["correct_pred_tokens"] += stats["correct_pred_tokens"]
-        total["predicted_tokens"] += stats["predicted_tokens"]
-        total["full_hits"] += int(stats["full_recall"] == 1.0)
-    return {
-        "window_size": window_size,
-        "threshold": float(threshold),
-        "precision": total["correct_pred_spans"] / max(
-            total["correct_pred_spans"] + total["false_pred_spans"], 1
-        ),
-        "recall": total["detected_gold_spans"] / max(
-            total["detected_gold_spans"] + total["missed_gold_spans"], 1
-        ),
-        "token_precision": total["correct_pred_tokens"] / max(total["predicted_tokens"], 1),
-        "total_pred_spans": total["correct_pred_spans"] + total["false_pred_spans"],
-        "avg_pred_spans_per_sample": (total["correct_pred_spans"] + total["false_pred_spans"]) / max(len(records), 1),
-        "full_recall": total["full_hits"] / max(len(records), 1),
-        **total,
-        "samples": len(records),
-    }
-
-
-def threshold_metrics(records: list[dict], args) -> list[dict]:
+def shape_metrics(records: list[dict], args) -> list[dict]:
     rows = []
     for window_size in int_grid(args.window_sizes):
-        rolled = [(rolling_max(r["real"], window_size), r["ideal"]) for r in records]
-        max_score = max(float(real.max()) for real, _ in rolled)
-        thresholds = [0.0] if max_score <= 0 else torch.linspace(0, max_score, args.threshold_steps).tolist()
-        # thresholds.append(min(float(real[ideal.bool()].min()) for real, ideal in rolled))
-        rows.extend(pooled_metrics(records, window_size, threshold) for threshold in sorted(set(thresholds)))
+        scores, leakage_scores, non_leak_penalties = [], [], []
+        for record in records:
+            real = rolling_max(record["real"], window_size)
+            if bool(record["ideal"].bool().any()):
+                score = float(cosine(real, record["ideal"]))
+                leakage_scores.append(score)
+            else:
+                penalty = float(topk_mean(real))
+                score = -penalty
+                non_leak_penalties.append(penalty)
+            scores.append(score)
+        score_tensor = torch.tensor(scores)
+        rows.append({
+            "window_size": window_size,
+            "mean_score": float(score_tensor.mean()),
+            "median_score": float(score_tensor.median()),
+            "min_score": float(score_tensor.min()),
+            "leakage_samples": len(leakage_scores),
+            "non_leakage_samples": len(non_leak_penalties),
+            "mean_leakage_cosine": (
+                float(torch.tensor(leakage_scores).mean()) if leakage_scores else None
+            ),
+            "mean_non_leak_top5": (
+                float(torch.tensor(non_leak_penalties).mean()) if non_leak_penalties else None
+            ),
+            "samples": len(records),
+        })
     return rows
 
 
-def harmonic_mean(a: float, b: float) -> float:
-    return 2 * a * b / max(a + b, EPS)
-
-
-def best_config_criteria(row: dict) -> tuple:
-    aug_precision = harmonic_mean(row["precision"], row["token_precision"])
-    score = harmonic_mean(aug_precision, row["recall"])
-    return (
-        score,
-        -row.get("top_k", 0),
-        -row["window_size"],
-        row["threshold"],
-    )
-
-
 def choose_config(rows: list[dict], args) -> dict:
-    feasible = [r for r in rows if r["full_recall"] >= 0.8 and r['threshold'] > 0]
-    if feasible:
-        return max(feasible, key=best_config_criteria)
     return max(
         rows,
         key=lambda r: (
-            r["full_recall"],
-            best_config_criteria(r)[0],
-            -r.get("top_k", 0),
+            r["mean_score"],
+            r["median_score"],
             -r["window_size"],
-            r["threshold"],
+            -r.get("top_k", 0),
         ),
     )
 
@@ -393,7 +339,7 @@ def clear_memory():
 
 
 def build_samples(path: Path, tokenizer, args):
-    rows = [row for row in read_jsonl(path) if row.get("leakage_spans")]
+    rows = [row for row in read_jsonl(path)]
     if args.max_samples:
         rows = rows[: args.max_samples]
     samples = [sample for row in rows if (sample := build_sample(row, tokenizer, args)) is not None]
@@ -415,32 +361,86 @@ def calibrate_head_scores(model, tokenizer, samples: list[dict], args) -> torch.
         clear_memory()
 
     scores = total / used
-    torch.save({"model": model_name_key(args), "scores": scores.cpu(), "used": used}, args.score_cache_path)
+    torch.save({
+        "model": model_name_key(args),
+        "score_method": SCORE_METHOD,
+        "scores": scores.cpu(),
+        "used": used,
+    }, args.score_cache_path)
     return scores
 
 
-def load_head_scores(args) -> torch.Tensor:
+def head_score_sum(model, tokenizer, samples: list[dict], args, desc: str) -> tuple[torch.Tensor, int]:
+    total, used = None, 0
+    for batch in tqdm(list(batches(samples, args.batch_size)), desc=desc):
+        batch_attn = get_batch_attention_weights(model, tokenizer, batch)
+        for batch_idx, sample in enumerate(batch):
+            sample_attn = take_sample_attentions(batch_attn, batch_idx, len(sample["input_ids"]))
+            scores = head_scores(sample_attn, sample)
+            total = scores if total is None else total + scores
+            used += 1
+        del batch_attn
+        clear_memory()
+    if total is None:
+        raise RuntimeError(f"No samples available for {desc}.")
+    return total, used
+
+
+def load_head_scores(model, tokenizer, samples: list[dict], args) -> torch.Tensor:
     cache = torch.load(args.score_cache_path, map_location="cpu")
     if cache.get("model") != model_name_key(args):
         warnings.warn(
             f"Cache is for {cache.get('model')}, but --model is {model_name_key(args)}.",
             UserWarning,
         )
+    if cache.get("score_method") == SCORE_METHOD:
+        print(f"Loaded head scores from {args.score_cache_path}.")
+        return cache["scores"]
+
+    if int(cache.get("used", -1)) != len(samples):
+        raise ValueError(
+            "Old head-score cache cannot be upgraded because cache['used'] "
+            f"={cache.get('used')} but current usable samples={len(samples)}. "
+            "Run without --from-cache to recompute from scratch."
+        )
+
+    print("Legacy: Upgrading old head-score cache to new score method.")
+    empty_samples = [sample for sample in samples if not sample["ideal"].bool().any()]
+    if empty_samples:
+        empty_total, empty_used = head_score_sum(
+            model,
+            tokenizer,
+            empty_samples,
+            args,
+            desc="Scoring empty-leakage samples",
+        )
+        scores = cache["scores"].float() + empty_total / len(samples)
+    else:
+        empty_used = 0
+
+    torch.save({
+        "model": model_name_key(args),
+        "score_method": SCORE_METHOD,
+        "scores": scores.cpu(),
+        "used": len(samples),
+    }, args.score_cache_path)
     print(f"Loaded head scores from {args.score_cache_path}.")
-    return cache["scores"]
+    print(f"Upgraded old cache with {empty_used} empty-leakage samples.")
+    return scores
 
 
 def detector_records_by_k(model, tokenizer, samples: list[dict], scores: torch.Tensor, args):
-    top_ks = int_grid(args.top_k_values, args.top_k, scores.numel())
-    heads_by_k = {k: top_heads(scores, k) for k in top_ks}
+    top_ks = int_grid(args.top_k_values, args.top_k, scores.numel())    # [1, 2, 4, 8, 16, ...]
+    heads_by_k = {k: top_heads(scores, k) for k in top_ks}  # {k: [{"layer": 0, "head": 0, "score": 1.0}, ...], ...}
     records_by_k = {k: [] for k in top_ks}
 
-    for batch in tqdm(list(batches(samples, args.batch_size)), desc="Calibrating k/window/threshold"):
+    for batch in tqdm(list(batches(samples, args.batch_size)), desc="Calibrating k/window"):
         batch_attn = get_batch_attention_weights(model, tokenizer, batch)
         for batch_idx, sample in enumerate(batch):
             sample_attn = take_sample_attentions(batch_attn, batch_idx, len(sample["input_ids"]))
+            # compute real attention vectors to privileged context for each head
             raw = attention_to_context(sample_attn, sample["prompt_len"], sample["key_tokens"])
-            vectors = positive_median_normalize(raw)
+            vectors = raw
             for k, heads in heads_by_k.items():
                 real = aggregate_normalized_vectors(vectors, heads, args.aggregation)
                 records_by_k[k].append({"real": real.cpu(), "ideal": sample["ideal"].cpu()})
@@ -460,22 +460,22 @@ def save_detector_config(heads: list[dict], best: dict, args):
         "heads": heads,
         "aggregation": args.aggregation,
         "window_size": best["window_size"],
-        "threshold": best["threshold"],
-        "val_calibration_precision": best["precision"],
-        "val_calibration_recall": best["recall"],
-        "val_calibration_full_recall": best["full_recall"],
-        "val_selection_token_precision": best["token_precision"],
-        "val_avg_pred_spans_per_sample": best["avg_pred_spans_per_sample"],
+        "threshold": None,
+        "val_calibration_mean_score": best["mean_score"],
+        "val_calibration_median_score": best["median_score"],
+        "val_calibration_min_score": best["min_score"],
         "test_precision": None,
         "test_recall": None,
         "test_full_recall": None,
+        "test_f1": None,
+        "test_token_precision": None,
+        "test_avg_pred_spans": None,
     }
     write_json(config, args.detector_config_path)
     print(
-        f"top_k={best['top_k']} threshold={best['threshold']:.6g} window={best['window_size']} "
-        f"span_precision={best['precision']:.4f} token_precision={best['token_precision']:.4f} "
-        f"avg_pred_spans={best['avg_pred_spans_per_sample']:.2f} "
-        f"recall={best['recall']:.4f}"
+        f"top_k={best['top_k']} window={best['window_size']} "
+        f"mean_score={best['mean_score']:.4f} "
+        f"median_score={best['median_score']:.4f}"
     )
 
 
@@ -487,16 +487,21 @@ def calibrate(model, tokenizer, args):
 
     samples = build_samples(args.calibrate_path, tokenizer, args)
     val_samples = build_samples(args.val_calibrate_path, tokenizer, args)
-    scores = load_head_scores(args) if args.from_cache else calibrate_head_scores(model, tokenizer, samples, args)
 
+    # compute the similarity score for each head
+    # scores shape = (num_layers, num_heads)
+    scores = load_head_scores(model, tokenizer, samples, args) if args.from_cache else calibrate_head_scores(model, tokenizer, samples, args)
+
+    # compute real attention vectors for each data sample by each top-k config
     heads_by_k, records_by_k, top_ks = detector_records_by_k(model, tokenizer, val_samples, scores, args)
     # heads_by_k = {k: [{"layer": 0, "head": 0, "score": 1.0}, ...], ...}
     # records_by_k = {k: [{"real": tensor, "ideal": tensor}, ...], ...}
     # top_ks = [1, 2, 4, 8, 16] or user-specified
 
+    # compute leakage cosine or non-leakage top-5-mean penalty for all top-k/window configs
     all_metrics = []
     for k in top_ks:
-        rows = [{**row, "model": key, "top_k": k} for row in threshold_metrics(records_by_k[k], args)]
+        rows = [{**row, "model": key, "top_k": k} for row in shape_metrics(records_by_k[k], args)]
         all_metrics.extend(rows)
 
     best = choose_config(all_metrics, args)
@@ -507,8 +512,8 @@ def calibrate(model, tokenizer, args):
 
 def main():
     args = parse_args()
-    if args.batch_size < 1 or args.threshold_steps < 1:
-        raise ValueError("--batch-size and --threshold-steps must be positive.")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be positive.")
     for path in (args.score_cache_path, args.all_experiments_path, args.detector_config_path):
         path.parent.mkdir(parents=True, exist_ok=True)
 

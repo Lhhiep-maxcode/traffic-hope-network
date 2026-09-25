@@ -3,16 +3,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 from pathlib import Path
 
-from prompt import SYSTEM_PROMPT, USER_PROMPT
 from tqdm import tqdm
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from method.calibrate_leakage_detector.prompt import JUDGE_SYSTEM_PROMPT, USER_PROMPT
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -41,7 +43,14 @@ def parse_args():
     parser.add_argument("--disable-thinking", action="store_true")
     parser.add_argument("--generation-max-new-tokens", type=int, default=1024)
     parser.add_argument("--generation-temperature", type=float, default=0.7)
-    parser.add_argument("--judge-max-new-tokens", type=int, default=256)
+    parser.add_argument("--judge-max-new-tokens", type=int, default=512)
+    parser.add_argument("--judge-retries", type=int, default=2)
+    parser.add_argument(
+        "--judge-reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high", "xhigh"],
+        default=None,
+        help="Set this for reasoning judge models; temperature is then omitted.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -177,21 +186,24 @@ def build_prompt(problem: str, answer: str) -> dict:
     }
 
 
-def leakage_spans(judge_output: str, response: str) -> list[str]:
+def parse_spans(judge_output: str, response: str) -> list[str]:
+    start, end = judge_output.find("["), judge_output.rfind("]")
+    if start < 0 or end < start:
+        raise ValueError(f"Judge did not return a JSON array: {judge_output[:300]!r}")
+    values = json.loads(judge_output[start : end + 1])
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise ValueError("Judge output must be a JSON array of strings.")
+
     spans = []
-    for span in braced_blocks(judge_output, r"\text"):
-        span = span.strip().strip('"').strip("'")
-        if span in response and span not in spans:
-            spans.append(span)
-    return spans
-
-
-def leakage_label(judge_output: str) -> str:
-    for box in braced_blocks(judge_output, r"\boxed"):
-        match = re.fullmatch(r"\s*(FAILED|PASS)\s*", box.upper())
-        if match:
-            return match.group(1)
-    return "FAILED"
+    for value in values:
+        value = value.strip()
+        if not value:
+            continue
+        if value not in response:
+            raise ValueError(f"Judge returned a span not copied from the response: {value!r}")
+        if value not in spans:
+            spans.append(value)
+    return sorted(spans, key=response.find)
 
 
 
@@ -200,6 +212,8 @@ def openai_client(base_url: str, api_key: str):
         from openai import AsyncOpenAI
     except ImportError as exc:
         raise ImportError("Install the OpenAI Python package first: pip install openai") from exc
+    if base_url.rstrip("/") == "https://api.openai.com/v1" and api_key == "EMPTY":
+        api_key = os.getenv("OPENAI_API_KEY") or api_key
     return AsyncOpenAI(base_url=base_url, api_key=api_key)
 
 
@@ -308,7 +322,11 @@ async def generate_rows(args, output_path: Path) -> list[dict]:
 
 
 async def judge_rows(args, rows: list[dict], output_path: Path):
-    done = existing_keys(output_path, judge_key)
+    done = {
+        judge_key(row)
+        for row in read_jsonl_loose(output_path, repair=True)
+        if "leakage_spans" in row
+    }
     rows = [row for row in rows if judge_key(row) not in done]
     print(f"Judge resume: {len(done)} existing rows, {len(rows)} remaining rows")
 
@@ -317,18 +335,40 @@ async def judge_rows(args, rows: list[dict], output_path: Path):
     client = openai_client(base_url, api_key)
 
     async def judge_one(row: dict):
-        judge_prompt = USER_PROMPT.format(prompt=row["prompt"], response=row["response"])
-        judge_output = await complete(
-            client,
-            args.judge_model,
-            judge_prompt,
-            args.judge_max_new_tokens,
-            temperature=0.0,
-            system_prompt=SYSTEM_PROMPT,
-            enable_thinking=False,
+        judge_prompt = USER_PROMPT.format(
+            full_prompt=row["prompt"],
+            context=row["privileged_context"],
+            response=row["response"],
         )
-        label = leakage_label(judge_output)
-        return {**row, "leakage": label == "FAILED"}
+        last_error = None
+        for _ in range(args.judge_retries + 1):
+            user_prompt = judge_prompt
+            if last_error is not None:
+                user_prompt = (
+                    f"{judge_prompt}\n\n"
+                    f"Previous judge attempt failed with error: {last_error}\n"
+                    "Return only a valid JSON array of exact copied leakage spans."
+                )
+            request = {
+                "model": args.judge_model,
+                "messages": [
+                    {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_completion_tokens": args.judge_max_new_tokens,
+            }
+            if args.judge_reasoning_effort:
+                request["reasoning_effort"] = args.judge_reasoning_effort
+            else:
+                request["temperature"] = 0.0
+
+            result = await client.chat.completions.create(**request)
+            judge_output = result.choices[0].message.content or ""
+            try:
+                return {**row, "leakage_spans": parse_spans(judge_output, row["response"])}
+            except (ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+        raise ValueError(f"Could not parse judge output after retries: {last_error}")
 
     try:
         if rows:

@@ -3,3 +3,6 @@ __pycache__/
 *jpg
 .DS_Store
 .vscode
+.env
+.env.*
+!.env.example
