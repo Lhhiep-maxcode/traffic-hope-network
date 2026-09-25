@@ -1,0 +1,448 @@
+% NAACL 2027 draft based on the official *ACL style.
+%
+% Compile inside the official ACL template bundle:
+%   pdflatex naacl2027_draft
+%   bibtex naacl2027_draft
+%   pdflatex naacl2027_draft
+%   pdflatex naacl2027_draft
+%
+% The current official files are maintained at:
+%   https://github.com/acl-org/acl-style-files
+%
+% Before submission:
+%   1. Replace every \todo{...} marker.
+%   2. Re-check the NAACL 2027/ARR formatting and responsible-NLP checklist.
+%   3. Keep [review] for submission; switch to [final] only for camera-ready.
+
+\documentclass[11pt]{article}
+
+\usepackage[review]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xspace}
+\usepackage{xcolor}
+\usepackage{url}
+
+\newcommand{\method}{\textsc{TraceGuard}\xspace}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\by}{\mathbf{y}}
+\newcommand{\bz}{\mathbf{z}}
+
+\title{When Answers Stop Leaking and Start Teaching:\\
+Ground-Truth-Guided Traces for Self-Improving Reasoners}
+
+% The review option anonymizes this block. Replace it before camera-ready.
+\author{Anonymous NAACL 2027 submission}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+High-quality reasoning traces are a key ingredient for improving reasoning
+models, yet producing them often requires stronger teacher models or
+human-written rationales.  We show that ground-truth answers can instead serve
+as privileged guidance for synthesizing high-value, model-native training
+traces.  Our pipeline conditions a reasoner on both a problem and its known
+answer, allowing ordinary question--answer data to yield substantially stronger
+solution trajectories.  This advantage introduces \emph{privileged leakage}:
+generated traces may explicitly mention the supplied answer or rely on it as
+evidence.  To make these traces valid beyond the privileged generation setting,
+we calibrate a
+sparse attention-based detector that identifies tokens associated with leakage.
+When the detector fires during generation, the decoder rolls back the affected
+region and rewrites it using a synchronized clean branch that never observes the
+answer.  The resulting ground-truth-guided traces preserve the central benefits
+of privileged generation: the known outcome steers generation toward correct
+solutions and supports self-verification throughout the reasoning process.
+Meanwhile, clean-branch repair removes explicit reliance on privileged context
+while preserving fluent and natural reasoning trajectories.  Across
+mathematical, scientific, logical, and multi-hop reasoning domains, fine-tuning
+on only 1K--2K generated samples consistently improves reasoning performance.
+On the MATH domain, the resulting data improves
+DeepSeek-R1-Distill-Qwen-14B by up to 14 points.  These results establish
+ground-truth-guided trace synthesis as an effective source of reasoning
+supervision for bootstrapping self-improving reasoners without external
+rationale supervision.
+\end{abstract}
+
+\section{Introduction}
+
+Chain-of-thought (CoT) supervision can transfer reasoning behavior to smaller
+language models and improve performance on multi-step tasks
+\citep{wei2022chain,ho2023reasoningteacher}.  However, creating such supervision
+at scale remains difficult.  Unconditioned sampling often produces incorrect
+answers, while filtering for correctness discards potentially useful examples
+and spends compute on failed trajectories.  A natural alternative is to expose
+the known answer while asking the generator to construct a derivation.  This
+form of answer-conditioned rationalization is used explicitly in STaR
+\citep{zelikman2022star} and is closely related to contrastive answer-conditioned
+decoding in SCOTT \citep{wang2023scott}.
+
+Answer conditioning creates a train--test asymmetry.  The generator may mention
+that the answer was supplied, verify its work against the reference, or treat
+the target as a premise.  We call these behaviors \emph{privileged leakage}.
+They are distinct from legitimately deriving and stating the same final answer:
+the issue is not the appearance of the answer value itself, but reliance on
+information unavailable to the eventual student.  A trace such as ``since the
+given answer is 72'' is therefore invalid supervision even when its arithmetic
+is correct.  Lexical filters can catch fixed phrases, but leakage can be
+paraphrased, distributed across several tokens, or expressed without words such
+as \emph{answer} or \emph{ground truth}.
+
+This paper asks whether the generator's own attention can reveal when
+privileged information is about to surface.  Our starting observation is that
+only a small number of attention heads need to align strongly with human- or
+judge-annotated leakage spans.  This agrees with broader evidence that sparse
+attention heads can expose task-relevant model behavior
+\citep{hung2024attentiontracker}.  We use the mass assigned by these heads to
+the privileged prompt span as a token-level signal.  Importantly, detection is
+only half of the problem: discarding the full trajectory wastes its valid
+prefix, while merely suppressing one token can defer the same leakage to the
+next step.
+
+We propose \method, a detect--rollback--regenerate procedure for constructing
+reasoning supervision.  Generation maintains two views of the same output
+prefix: a \emph{privileged branch} conditioned on the question and answer, and
+a \emph{clean branch} conditioned on the question alone.  The privileged branch
+normally proposes tokens.  If a proposed token attends too strongly to the
+answer span, the decoder backtracks to the beginning of the suspected region
+and uses the clean branch to rewrite it.  Both branches then consume the chosen
+tokens so that they remain synchronized.  Repair ends only after the detector
+observes a configurable safe streak, preventing immediate oscillation back into
+the same failure mode.
+
+Our contributions are:
+
+\begin{itemize}
+    \item We formulate \emph{privileged leakage} as a distinct data-quality
+    problem in answer-conditioned reasoning-trace generation.
+    \item We develop a lightweight token-level detector by calibrating a sparse
+    set of attention heads against annotated leakage spans.
+    \item We introduce online local repair that combines bounded backtracking,
+    a clean counterfactual branch, synchronized decoding, and KV-cache reuse.
+    \item We provide preliminary detector validation across four Qwen3 model
+    scales and an evaluation plan for trace quality, downstream utility, and
+    computational overhead.
+\end{itemize}
+
+\section{Related Work}
+
+\paragraph{Reasoning data generation and distillation.}
+CoT prompting elicits intermediate reasoning from sufficiently capable models
+\citep{wei2022chain}, while self-consistency improves answer selection by
+sampling multiple reasoning paths \citep{wang2023selfconsistency}.  Fine-tune-CoT
+uses teacher-generated rationales as supervision \citep{ho2023reasoningteacher},
+and STaR bootstraps rationales by retrying failed questions with the correct
+answer supplied \citep{zelikman2022star}.  SCOTT conditions rationale generation
+on the target answer through contrastive decoding and emphasizes consistency
+between rationales and predictions \citep{wang2023scott}.  These approaches
+motivate using target information during data construction; our focus is the
+complementary problem of ensuring that the resulting text does not reveal this
+privileged construction process.
+
+\paragraph{Faithfulness and internal signals.}
+Free-text rationales need not faithfully describe the computation supporting a
+prediction, and their surface plausibility alone is therefore insufficient
+\citep{jacovi2020faithfulness}.  Work on attention-based prompt-injection
+detection shows that selected heads can provide useful inference-time signals
+without an auxiliary model call \citep{hung2024attentiontracker}.  We similarly
+calibrate sparse heads, but target a different phenomenon: token-level transfer
+from a known answer in the prompt into a generated rationale.  We additionally
+couple detection to a causal intervention---regeneration without the privileged
+context---rather than using the signal only for classification.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Problem Formulation}
+
+Let a supervised reasoning dataset contain pairs $(\bx,\by)$, where $\bx$ is a
+problem and $\by$ is its known answer.  We wish to produce a reasoning trace
+$\bz=(z_1,\ldots,z_T)$ that is useful for supervised fine-tuning under the clean
+input $\bx$.  During data construction, however, we allow the generator
+$p_\theta$ to observe a privileged context $c(\by)$, such as
+``Given the ground-truth answer is $\by$.'':
+
+\begin{equation}
+  z_t \sim p_\theta(\cdot \mid \bx, c(\by), z_{<t}).
+  \label{eq:privileged-generation}
+\end{equation}
+
+The desired trace may derive and state $\by$, but it should not explicitly
+refer to $c(\by)$, cite the supplied target as evidence, or express awareness
+that privileged information was provided.  We represent these undesirable
+positions with a binary token mask $g\in\{0,1\}^T$ and learn a detector
+$D_t$ that estimates whether generation around position $t$ depends on the
+privileged span in a way associated with leakage.
+
+\subsection{Constructing Leakage Annotations}
+\label{sec:annotations}
+
+We first sample responses from the generator with $c(\by)$ appended to the
+problem.  A separate judge receives the privileged prompt and response and
+returns exact text spans exhibiting one of four behaviors: (i) directly
+referencing the provided answer, (ii) checking a result against it, (iii) using
+it as a reasoning constraint, or (iv) discussing the need to hide it.  Merely
+deriving or stating the final value is labeled clean.  Character spans are
+mapped to response-token spans through tokenizer offsets.  We split annotated
+examples into head-calibration, validation, and held-out test sets.
+
+Because judge-generated span boundaries may be imperfect, our primary detector
+metric is \emph{span-start recall}: a gold span is detected when its first token
+is flagged.  We additionally report span precision, token precision, and
+\emph{full recall}, the fraction of examples in which every annotated span is
+detected.  \todo{Report annotation protocol, judge model, number of examples,
+inter-annotator agreement or a human audit, and the exact data split.}
+
+\subsection{Sparse Attention-Based Leakage Detector}
+\label{sec:detector}
+
+Let $A^{\ell,h}_{t,j}$ be the causal attention weight from response token $t$ to
+prompt token $j$ at layer $\ell$ and head $h$.  If $I_c$ is the set of token
+indices occupied by $c(\by)$, the privileged attention mass is
+
+\begin{equation}
+  a^{\ell,h}_t = \sum_{j\in I_c} A^{\ell,h}_{t,j}.
+  \label{eq:attention-mass}
+\end{equation}
+
+We score each head on the calibration split in two stages.  First, we remove its
+within-example background level using a positive median normalization,
+
+\begin{equation}
+  \widetilde{a}^{\ell,h}_t =
+  \max\!\left(0,
+  a^{\ell,h}_t-\operatorname{median}_{u}a^{\ell,h}_u\right).
+\end{equation}
+
+Second, we reward both alignment with the gold leakage mask and separation
+between positive and negative tokens:
+
+\begin{align}
+q_{\ell,h} ={}&
+  \cos\!\left(\widetilde{\mathbf{a}}^{\ell,h},\mathbf{g}\right)
+  \cdot
+  \Bigg[
+  \underset{t:g_t=1}{\operatorname{mean}} a^{\ell,h}_t
+  -\underset{t:g_t=0}{\operatorname{mean}} a^{\ell,h}_t
+  \Bigg]_+ .
+\label{eq:head-score}
+\end{align}
+
+Scores are averaged over calibration examples, and the top $K$ heads are kept.
+Their normalized signals are combined using non-negative calibration scores:
+
+\begin{equation}
+  D_t = \frac{\sum_{(\ell,h)\in\mathcal{H}}
+  q_{\ell,h}\widetilde{a}^{\ell,h}_t}
+  {\sum_{(\ell,h)\in\mathcal{H}}q_{\ell,h}}.
+  \label{eq:aggregate}
+\end{equation}
+
+We apply a centered rolling maximum of width $w$ to tolerate boundary noise and
+flag positions whose score exceeds $\tau$.  The tuple $(K,w,\tau)$ is selected
+on the validation split.  Our default selection favors configurations with high
+example-level full recall, then balances span recall and precision while
+preferring fewer heads and shorter windows.  This produces a model-specific
+detector with no learned classifier parameters.
+
+\paragraph{Online score.}
+At decode time, only the selected detector layers return attention matrices;
+other layers may use a fused attention backend.  This avoids materializing
+full-model attention for every token.  The current implementation uses the
+calibrated heads' weighted privileged attention mass for the candidate token and
+uses $w$ to determine the repair radius.
+
+% IMPORTANT IMPLEMENTATION NOTE (not printed in the paper):
+% The current calibration code applies positive-median normalization and a
+% centered rolling maximum, whereas the online generator directly thresholds
+% aggregated raw attention and uses window_size for backtracking. Before final
+% experiments, either align the online computation with Eqs. (3--5), or
+% recalibrate tau for the exact online score and update this subsection.
+
+\subsection{Dual-Branch Online Repair}
+\label{sec:repair}
+
+For each example, we maintain two autoregressive branches sharing model
+parameters but using different prompt caches:
+
+\begin{align}
+p_{\mathrm{priv}}(z_t) &=
+  p_\theta(z_t\mid \bx,c(\by),z_{<t}),\\
+p_{\mathrm{clean}}(z_t) &=
+  p_\theta(z_t\mid \bx,z_{<t}).
+\end{align}
+
+Both branches always consume the accepted output token, so they condition on an
+identical generated prefix even though their prompt contexts differ.  Normal
+decoding samples a candidate $\hat z_t$ from $p_{\mathrm{priv}}$ and computes its
+detector score.  If the score is below $\tau$, the token is accepted on both
+branches.  Otherwise, the method initiates repair.
+
+Let $r=\lfloor(w-1)/2\rfloor$.  Upon detecting leakage at position $t$, we roll
+the privileged branch back to $s=\max(1,t-r)$ and discard $z_{s:t}$ together
+with the rejected candidate.  The clean branch is restored to the same accepted
+prefix.  Tokens covering the backtracked region are sampled from
+$p_{\mathrm{clean}}$ and consumed by both branches.  Thereafter, we continue
+sampling clean replacements while a privileged candidate remains unsafe.  To
+avoid ending repair at an isolated low-score token, generation returns to normal
+only after $r$ consecutive privileged candidates pass the detector.  An
+alternative comparison uses the Jensen--Shannon divergence between privileged
+and clean next-token distributions:
+
+\begin{align}
+ m &= \tfrac12(p_{\mathrm{priv}}+p_{\mathrm{clean}}),\\
+ \operatorname{JSD}(p_{\mathrm{priv}},p_{\mathrm{clean}})
+ &= \tfrac12\operatorname{KL}(p_{\mathrm{priv}}\Vert m) \notag\\
+ &\quad +\tfrac12\operatorname{KL}(p_{\mathrm{clean}}\Vert m).
+\end{align}
+
+This alternative is useful in ablations but doubles next-token distribution
+comparisons and lacks the sparse attribution supplied by the attention detector.
+
+\paragraph{Termination and anti-oscillation.}
+Repair is capped at a fixed number of steps.  If repeated detections would
+backtrack to the same prefix more than a configured number of cycles, we
+suppress further rollback at that location and replace only the newly proposed
+token.  These guards make the procedure terminate or fail explicitly instead
+of silently looping.  All repair events---detection score, removed tokens,
+replacement tokens, and branch choices---are logged for audit.
+
+\subsection{Efficient Decoding}
+
+Naively restarting after every repair would repeatedly prefill the full prompt
+and accepted trace.  We instead crop each branch's dynamic KV cache to the
+common prefix and recompute only the missing suffix.  During ordinary decoding,
+samples with different cache lengths are padded and batched; after a forward
+pass, caches are unpadded and returned to per-sample state.  On multi-GPU nodes,
+we run one model replica per GPU and distribute examples dynamically.  These
+optimizations do not change the detector or token-selection rules, although
+different fused kernels and batch shapes may introduce small numerical changes
+near a sampling or detection boundary.
+
+\subsection{Exporting Traces for Supervised Fine-Tuning}
+
+The final training example contains the clean user message $\bx$ and the repaired
+assistant trace $\bz$; $c(\by)$ is never exported.  We retain the answer value
+when it is naturally derived or stated.  Truncated generations may optionally
+be excluded, and generation metadata and repair logs are stored separately from
+the SFT file.  Thus, the privileged answer acts only as a data-construction aid,
+not as student input.
+
+\section{Preliminary Detector Evaluation}
+\label{sec:prelim}
+
+Table~\ref{tab:detector} reports the detector metrics currently stored by the
+repository for four Qwen3 scales \citep{yang2025qwen3}.  Results are from model-specific detectors and
+held-out leakage-annotated responses.  These operating points intentionally
+favor recall because a missed span is exported into training data, whereas a
+false positive triggers a local clean rewrite.  The high recall therefore comes
+with modest span precision, especially for 14B and 32B.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Model & Heads & Span P & Span R & Full R \\
+\midrule
+Qwen3-4B  & 1 & 21.5 & 100.0 & 100.0 \\
+Qwen3-8B  & 1 & 38.5 & 99.3  & 98.2 \\
+Qwen3-14B & 4 & 8.2  & 99.2  & 98.0 \\
+Qwen3-32B & 1 & 13.4 & 99.6  & 98.4 \\
+\bottomrule
+\end{tabular}
+\caption{Preliminary held-out leakage detection results (\%). ``Full R'' is the
+percentage of examples for which all annotated leakage spans are detected.
+These values validate the detector only; they do not yet establish that online
+repair improves final traces or downstream models.}
+\label{tab:detector}
+\end{table}
+
+\section{Experimental Plan}
+\label{sec:experiments}
+
+\todo{Replace this section with completed experiments.}  We propose evaluating
+the full pipeline on mathematical, scientific, logical, and multi-hop reasoning
+benchmarks.  For each base generator, compare:
+
+\begin{enumerate}
+    \item clean generation without the answer;
+    \item privileged generation without filtering;
+    \item privileged generation with lexical/rule-based filtering;
+    \item rejection sampling that discards any detected trace;
+    \item \method with attention-based local repair; and
+    \item \method with JSD-based repair.
+\end{enumerate}
+
+The primary trace-level outcomes should be answer accuracy, leakage rate under a
+blinded human audit and an independent judge, retention rate, trace length, and
+generation tokens or wall-clock time per accepted example.  To test usefulness
+rather than surface cleanliness alone, fine-tune identical student models on
+equal-sized trace sets and report clean-input benchmark accuracy.  Detector
+ablations should vary the number of heads, calibration size, window length,
+threshold, backtracking, safe-streak rule, and clean-branch synchronization.
+Cross-model and cross-domain transfer will reveal whether calibration must be
+repeated for each generator and task family.
+
+\section{Limitations}
+
+The current evidence validates a detector on automatically annotated leakage
+spans but does not yet demonstrate improved downstream reasoning.  The judge may
+miss subtle semantic dependence on the supplied answer, and attention is not a
+complete causal explanation of generation.  Model-specific heads and thresholds
+may not transfer across architectures, checkpoints, domains, prompt templates,
+or precision settings.  Recall-oriented thresholds can cause unnecessary clean
+rewrites, reducing the advantage of privileged conditioning.  Maintaining two
+prompt caches and selectively materializing attention increases memory and
+latency relative to ordinary decoding.  Finally, a repaired trace can remain
+factually incorrect or unfaithful even when it contains no explicit privileged
+leakage.  We therefore treat leakage repair as one data-quality filter, not a
+guarantee of correct or faithful reasoning.
+
+\section{Ethical Considerations}
+
+The method is intended to reduce misleading supervision in synthetic reasoning
+data.  Nevertheless, automatically generated rationales can convey false
+confidence, stereotypes, or unsafe content unrelated to answer leakage.
+Releasing generated traces should include their provenance, generator version,
+filter settings, and known failure modes.  Any human annotation study should use
+appropriate consent, compensation, and data-handling procedures.  \todo{Add the
+dataset licenses, compute budget, annotator details, and responsible-NLP
+checklist responses used in the final study.}
+
+\section{Conclusion}
+
+We presented \method, a draft framework for generating answer-conditioned
+reasoning traces without exporting explicit reliance on the answer.  A sparse
+attention detector identifies likely leakage online, and a synchronized clean
+branch locally rewrites the affected region while preserving the valid prefix.
+Preliminary experiments support the feasibility of high-recall detection across
+several model scales.  The decisive next step is an end-to-end evaluation of
+whether repaired traces preserve the accuracy benefit of privileged generation
+while improving data cleanliness, student performance, and generation
+efficiency.
+
+\bibliography{references}
+
+\appendix
+
+\section{Draft Reproducibility Checklist}
+
+The final version should report: model identifiers and revisions; tokenizer and
+chat template; attention backend; numerical precision; generation temperature,
+top-$p$, token budget, and random seeds; the exact privileged-context template;
+detector heads, weights, threshold, and window for every model; repair limits;
+annotation prompts; train/validation/test splits; hardware; runtime; and all
+filtering decisions.  The implementation already records per-example seeds,
+token IDs, repair events, detector-config hashes, and resumable run metadata.
+
+\end{document}

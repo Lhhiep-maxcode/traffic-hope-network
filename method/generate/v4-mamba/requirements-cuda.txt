@@ -1,0 +1,5 @@
+# Optional for native Mamba CPU tests; required by NVIDIA remote Nemotron-H.
+# Install with --no-build-isolation after torch; wheels must match Torch/Python/CUDA.
+causal-conv1d==1.7.0
+mamba-ssm==2.3.2.post1
+z3-solver==4.15.4.0
