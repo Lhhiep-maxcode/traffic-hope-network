@@ -1,0 +1,70 @@
+\begin{thebibliography}{8}
+\providecommand{\natexlab}[1]{#1}
+
+\bibitem[{Ho et~al.(2023)Ho, Schmid, and Yun}]{ho2023reasoningteacher}
+Namgyu Ho, Laura Schmid, and Se-Young Yun. 2023.
+\newblock \href {https://doi.org/10.18653/v1/2023.acl-long.830} {Large language
+  models are reasoning teachers}.
+\newblock In \emph{Proceedings of the 61st Annual Meeting of the Association
+  for Computational Linguistics (Volume 1: Long Papers)}, pages 14852--14882,
+  Toronto, Canada. Association for Computational Linguistics.
+
+\bibitem[{Hung et~al.(2024)Hung, Ko, Rawat, Chung, Hsu, and
+  Chen}]{hung2024attentiontracker}
+Kuo-Han Hung, Ching-Yun Ko, Ambrish Rawat, I-Hsin Chung, Winston~H. Hsu, and
+  Pin-Yu Chen. 2024.
+\newblock \href {https://arxiv.org/abs/2411.00348} {Attention tracker:
+  Detecting prompt injection attacks in {LLM}s}.
+\newblock \emph{arXiv preprint arXiv:2411.00348}.
+
+\bibitem[{Jacovi and Goldberg(2020)}]{jacovi2020faithfulness}
+Alon Jacovi and Yoav Goldberg. 2020.
+\newblock \href {https://doi.org/10.18653/v1/2020.acl-main.386} {Towards
+  faithfully interpretable {NLP} systems: How should we define and evaluate
+  faithfulness?}
+\newblock In \emph{Proceedings of the 58th Annual Meeting of the Association
+  for Computational Linguistics}, pages 4198--4205, Online. Association for
+  Computational Linguistics.
+
+\bibitem[{Wang et~al.(2023{\natexlab{a}})Wang, Wang, Li, Gao, Yin, and
+  Ren}]{wang2023scott}
+Peifeng Wang, Zhengyang Wang, Zheng Li, Yifan Gao, Bing Yin, and Xiang Ren.
+  2023{\natexlab{a}}.
+\newblock \href {https://doi.org/10.18653/v1/2023.acl-long.304} {{SCOTT}:
+  Self-consistent chain-of-thought distillation}.
+\newblock In \emph{Proceedings of the 61st Annual Meeting of the Association
+  for Computational Linguistics (Volume 1: Long Papers)}, pages 5546--5558,
+  Toronto, Canada. Association for Computational Linguistics.
+
+\bibitem[{Wang et~al.(2023{\natexlab{b}})Wang, Wei, Schuurmans, Le, Chi,
+  Narang, Chowdhery, and Zhou}]{wang2023selfconsistency}
+Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc~V. Le, Ed~H. Chi, Sharan Narang,
+  Aakanksha Chowdhery, and Denny Zhou. 2023{\natexlab{b}}.
+\newblock Self-consistency improves chain of thought reasoning in language
+  models.
+\newblock In \emph{International Conference on Learning Representations}.
+
+\bibitem[{Wei et~al.(2022)Wei, Wang, Schuurmans, Bosma, Xia, Chi, Le, and
+  Zhou}]{wei2022chain}
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed~Chi,
+  Quoc~V. Le, and Denny Zhou. 2022.
+\newblock Chain-of-thought prompting elicits reasoning in large language
+  models.
+\newblock In \emph{Advances in Neural Information Processing Systems},
+  volume~35, pages 24824--24837.
+
+\bibitem[{Yang et~al.(2025)Yang, Li, Yang, Zhang, Hui, Zheng
+  et~al.}]{yang2025qwen3}
+An~Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo~Zheng, et~al.
+  2025.
+\newblock \href {https://arxiv.org/abs/2505.09388} {{Qwen3} technical report}.
+\newblock \emph{arXiv preprint arXiv:2505.09388}.
+
+\bibitem[{Zelikman et~al.(2022)Zelikman, Wu, Mu, and
+  Goodman}]{zelikman2022star}
+Eric Zelikman, Yuhuai Wu, Jesse Mu, and Noah~D. Goodman. 2022.
+\newblock {STaR}: Bootstrapping reasoning with reasoning.
+\newblock In \emph{Advances in Neural Information Processing Systems},
+  volume~35, pages 15476--15488.
+
+\end{thebibliography}

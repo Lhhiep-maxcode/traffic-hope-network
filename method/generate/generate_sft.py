@@ -24,7 +24,7 @@ from multiprocessing.connection import wait
 from pathlib import Path
 
 DIRECTORY = Path(__file__).resolve().parent
-INSTRUCTION = "Explain your solution step by step."
+INSTRUCTION = " Explain your solution step by step."
 
 
 @dataclass
