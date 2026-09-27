@@ -3,11 +3,11 @@ from __future__ import annotations
 import inspect
 import json
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 import torch
 from tqdm.auto import tqdm
-from enum import Enum
 
 
 def model_device(model):
@@ -119,6 +119,7 @@ class DecodeSettings:
 class RepairSettings:
     comparison_method: str = "attention_score"
     js_threshold: float = 0.1
+    max_steps: int = 128
 
 
 @dataclass
@@ -157,8 +158,14 @@ class AttentionLeakageDetector:
         )
 
     def with_context(self, context_token_indices: list[int]):
-        self.context_token_indices = list(context_token_indices)
-        return self
+        return AttentionLeakageDetector(
+            heads=self.heads,
+            threshold=self.threshold,
+            window_size=self.window_size,
+            aggregation=self.aggregation,
+            weights=self.weights,
+            context_token_indices=list(context_token_indices),
+        )
 
     def score(self, attentions) -> float:
         if attentions is None:
@@ -168,8 +175,9 @@ class AttentionLeakageDetector:
         if not self.context_token_indices:
             raise RuntimeError("The detector does not know privileged-context tokens.")
 
-        scores = []
-        for head in self.heads:
+        scores = [0.0] * len(self.heads)
+        scores_by_device = {}
+        for position, head in enumerate(self.heads):
             layer_index = int(head["layer"])
             head_index = int(head["head"])
             layer_attention = attentions[layer_index]
@@ -187,7 +195,14 @@ class AttentionLeakageDetector:
                     device=device,
                 )
             indices = self._indices_by_device[device]
-            scores.append(float(attention_row.index_select(0, indices).sum().item()))
+            scores_by_device.setdefault(device, []).append(
+                (position, attention_row.index_select(0, indices).sum())
+            )
+
+        for entries in scores_by_device.values():
+            values = torch.stack([value for _, value in entries]).tolist()
+            for (position, _), value in zip(entries, values):
+                scores[position] = float(value)
 
         weight_sum = sum(self.weights)
         if self.aggregation == "mean" or weight_sum <= 0:
@@ -254,6 +269,48 @@ class DecodeBranch:
                 break
         return self._forward_kwargs
 
+    def crop_cache(self, length: int) -> bool:
+        cache = self.past_key_values
+        cache_type = type(cache)
+        if (
+            cache_type.__module__ == "transformers.cache_utils"
+            and cache_type.__name__ == "DynamicCache"
+        ):
+            layers = getattr(cache, "layers", None)
+            if layers is not None:
+                if not layers or any(
+                    type(layer).__module__ != "transformers.cache_utils"
+                    or type(layer).__name__ != "DynamicLayer"
+                    or layer.get_seq_length() < length
+                    for layer in layers
+                ):
+                    return False
+            elif not getattr(cache, "key_cache", None) or any(
+                key.ndim != 4 or key.shape[-2] < length for key in cache.key_cache
+            ):
+                return False
+            if getattr(cache, "offloading", False):
+                return False
+            cache.crop(length)
+            return True
+
+        if isinstance(cache, (tuple, list)) and cache and all(
+            isinstance(layer, (tuple, list))
+            and len(layer) == 2
+            and all(
+                isinstance(value, torch.Tensor)
+                and value.ndim == 4
+                and value.shape[-2] >= length
+                for value in layer
+            )
+            for layer in cache
+        ):
+            self.past_key_values = tuple(
+                tuple(value[..., :length, :] for value in layer) for layer in cache
+            )
+            return True
+        return False
+
     def make_rng(self):
         device = torch.device(model_device(self.model))
         rng = torch.Generator(device=device)
@@ -284,6 +341,59 @@ class DecodeBranch:
         self.past_key_values = outputs.past_key_values
         self.next_logits = outputs.logits[:, -1, :].clone()
         self.cache_length = input_ids.shape[1]
+        self.finished = bool(
+            self.generated_ids
+            and self.tokenizer.eos_token_id is not None
+            and self.generated_ids[-1] == self.tokenizer.eos_token_id
+        )
+
+    @torch.no_grad()
+    def restore_prefix(self, prefix_ids: list[int], *, require_logits: bool = True):
+        prefix_ids = [int(token_id) for token_id in prefix_ids]
+        if self.past_key_values is None or self._prompt_ids is None:
+            self.start(prefix_ids)
+            return
+
+        common = 0
+        for old, new in zip(self.generated_ids, prefix_ids):
+            if old != new:
+                break
+            common += 1
+
+        prompt_length = self.prompt_ids().numel()
+        cropped = common < len(self.generated_ids)
+        if cropped:
+            if not self.crop_cache(prompt_length + common):
+                self.start(prefix_ids)
+                return
+            self.generated_ids = self.generated_ids[:common]
+            self.cache_length = prompt_length + common
+            self.next_logits = None
+
+        suffix = prefix_ids[common:]
+        if suffix:
+            input_ids = torch.tensor(
+                [suffix],
+                dtype=torch.long,
+                device=model_device(self.model),
+            )
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=self.mask(prompt_length + len(prefix_ids)),
+                past_key_values=self.past_key_values,
+                use_cache=True,
+                output_attentions=False,
+                return_dict=True,
+                **self.last_logit_kwargs(),
+            )
+            self.past_key_values = outputs.past_key_values
+            self.next_logits = outputs.logits[:, -1, :].clone()
+        elif require_logits and cropped:
+            self.start(prefix_ids)
+            return
+
+        self.generated_ids = prefix_ids
+        self.cache_length = prompt_length + len(prefix_ids)
         self.finished = bool(
             self.generated_ids
             and self.tokenizer.eos_token_id is not None
@@ -396,11 +506,12 @@ class LeakageSafeGenerator:
         self.repair = repair or RepairSettings()
         if self.repair.comparison_method not in {"attention_score", "js_divergence"}:
             raise ValueError("comparison_method must be attention_score or js_divergence.")
+        if self.repair.max_steps < 1:
+            raise ValueError("repair.max_steps must be positive.")
         self.detector = detector
         self.backtrack_tokens = max((self.detector.window_size - 1) // 2, 0)
         self.repair_events: list[dict] = []
         self.last_detector_score = None
-        self.repairing = False
         self.generated_tokens_state: list[RepairState] = []
 
     def begin(self):
@@ -430,7 +541,7 @@ class LeakageSafeGenerator:
         self.clean.next_logits = None
         self.repair_events = []
         self.last_detector_score = None
-        self.repairing = False
+        self.generated_tokens_state = []
 
     def output_ids(self):
         return self.privileged.generated_ids
@@ -459,9 +570,8 @@ class LeakageSafeGenerator:
 
         prefix = self.output_ids()[:start_index]
         self.generated_tokens_state = self.generated_tokens_state[:start_index]
-        self.privileged.start(prefix)
-        self.clean.start(prefix)
-        self.repairing = True
+        self.privileged.restore_prefix(prefix, require_logits=False)
+        self.clean.restore_prefix(prefix, require_logits=True)
         self.repair_events.append(
             {
                 "detected_index": detected_index,
@@ -493,7 +603,17 @@ class LeakageSafeGenerator:
         
         self.accept_on_both_branches(selected_id, privileged_outputs)
         event["replacement_token_ids"].append(int(selected_id))
-        event["replacement_token_text"] = self.tokenizer.decode([int(selected_id)], skip_special_tokens=True)
+        event["replacement_token_text"] = self.tokenizer.decode(
+            event["replacement_token_ids"],
+            skip_special_tokens=True,
+        )
+        event["steps"].append(
+            {
+                "token_index": len(self.output_ids()) - 1,
+                "selected_token_id": int(selected_id),
+                "selected_branch": "clean",
+            }
+        )
         return int(selected_id)
 
     def step(self):
@@ -508,7 +628,9 @@ class LeakageSafeGenerator:
         if not self.detected_leakage(score):
             self.privileged.accept(candidate_id, outputs)
             self.generated_tokens_state.append(RepairState.TEMP_SAFE)
-            self.generated_tokens_state[min(0, len(self.generated_tokens_state) - self.backtrack_tokens)] = RepairState.SAFE
+            safe_index = len(self.generated_tokens_state) - self.backtrack_tokens - 1
+            if safe_index >= 0:
+                self.generated_tokens_state[safe_index] = RepairState.SAFE
             return int(candidate_id)
 
         self.start_repair(candidate_id, score)

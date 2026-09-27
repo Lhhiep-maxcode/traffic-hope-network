@@ -65,7 +65,7 @@ def parse_args():
         default="attention_score",
     )
     parser.add_argument("--js-threshold", type=float, default=0.1)
-    parser.add_argument("--max-repair-steps", type=int, default=128)
+    parser.add_argument("--max-repair-steps", type=int, default=1000000)
     parser.add_argument("--max-repair-cycles-per-span", type=int, default=2)
     parser.add_argument(
         "--clean-backtrack",
@@ -149,6 +149,7 @@ def main():
     repair = RepairSettings(
         comparison_method=args.comparison_method,
         js_threshold=args.js_threshold,
+        max_steps=args.max_repair_steps,
     )
     generator = LeakageSafeGenerator(
         model=model,
