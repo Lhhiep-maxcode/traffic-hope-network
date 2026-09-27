@@ -91,19 +91,6 @@ def sample_from_logits(
     return int(torch.multinomial(probs, num_samples=1, generator=rng).item())
 
 
-def jensen_shannon_divergence(left_logits: torch.Tensor, right_logits: torch.Tensor) -> float:
-    log_p = torch.log_softmax(left_logits.float(), dim=-1)
-    log_q = torch.log_softmax(right_logits.float(), dim=-1)
-    log_m = torch.logaddexp(log_p, log_q) - torch.log(
-        torch.tensor(2.0, device=left_logits.device)
-    )
-    js = 0.5 * (
-        (log_p.exp() * (log_p - log_m)).sum()
-        + (log_q.exp() * (log_q - log_m)).sum()
-    )
-    return max(float(js.item()), 0.0)
-
-
 @dataclass
 class DecodeSettings:
     max_new_tokens: int = 2048
@@ -117,9 +104,7 @@ class DecodeSettings:
 
 @dataclass
 class RepairSettings:
-    comparison_method: str = "attention_score"
-    js_threshold: float = 0.1
-    max_steps: int = 128
+    pass
 
 
 @dataclass
@@ -362,6 +347,11 @@ class DecodeBranch:
 
         prompt_length = self.prompt_ids().numel()
         cropped = common < len(self.generated_ids)
+        suffix = prefix_ids[common:]
+        if require_logits and cropped and not suffix:
+            self.start(prefix_ids)
+            return
+
         if cropped:
             if not self.crop_cache(prompt_length + common):
                 self.start(prefix_ids)
@@ -370,7 +360,6 @@ class DecodeBranch:
             self.cache_length = prompt_length + common
             self.next_logits = None
 
-        suffix = prefix_ids[common:]
         if suffix:
             input_ids = torch.tensor(
                 [suffix],
@@ -388,9 +377,6 @@ class DecodeBranch:
             )
             self.past_key_values = outputs.past_key_values
             self.next_logits = outputs.logits[:, -1, :].clone()
-        elif require_logits and cropped:
-            self.start(prefix_ids)
-            return
 
         self.generated_ids = prefix_ids
         self.cache_length = prompt_length + len(prefix_ids)
@@ -481,7 +467,6 @@ class DecodeBranch:
 class RepairState(Enum):
     SAFE = 1
     TEMP_SAFE = 2
-    UNSAFE = 3
 
 
 class LeakageSafeGenerator:
@@ -504,10 +489,6 @@ class LeakageSafeGenerator:
         self.privileged_prompt = privileged_prompt or clean_prompt + privileged_context
         self.decode = decode or DecodeSettings()
         self.repair = repair or RepairSettings()
-        if self.repair.comparison_method not in {"attention_score", "js_divergence"}:
-            raise ValueError("comparison_method must be attention_score or js_divergence.")
-        if self.repair.max_steps < 1:
-            raise ValueError("repair.max_steps must be positive.")
         self.detector = detector
         self.backtrack_tokens = max((self.detector.window_size - 1) // 2, 0)
         self.repair_events: list[dict] = []
@@ -580,7 +561,6 @@ class LeakageSafeGenerator:
                 "removed_token_ids": [*removed_ids, int(candidate_id)],
                 "removed_token_text": self.tokenizer.decode(removed_ids + [int(candidate_id)], skip_special_tokens=True),
                 "replacement_token_ids": [],
-                "clean_backtrack_token_ids": [],
                 "steps": [],
             }
         )

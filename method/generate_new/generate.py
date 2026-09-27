@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.utils import load_model_and_tokenizer, read_jsonl
+from utils.utils import load_model_and_tokenizer
 from method.generate_new import (
     AttentionLeakageDetector,
     DecodeSettings,
@@ -59,34 +59,18 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument(
-        "--comparison-method",
-        choices=["attention_score", "js_divergence"],
-        default="attention_score",
-    )
-    parser.add_argument("--js-threshold", type=float, default=0.1)
-    parser.add_argument("--max-repair-steps", type=int, default=1000000)
-    parser.add_argument("--max-repair-cycles-per-span", type=int, default=2)
-    parser.add_argument(
-        "--clean-backtrack",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument(
-        "--prevent-infinite-loop",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--wait-safe-window",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
     parser.add_argument("--include-unfixed", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def read_jsonl(path: Path):
+    with path.open(encoding="utf-8") as source:
+        for line in source:
+            if line.strip():
+                yield json.loads(line)
 
 
 def prepare_prompt(row: dict, args) -> dict:
@@ -132,7 +116,7 @@ def main():
     detector = AttentionLeakageDetector.from_file(args.detector_config, model_key)
     model, tokenizer = load_model_and_tokenizer(
         args.model,
-        device=args.device,
+        device_map=args.device,
         dtype=args.dtype,
     )
 
@@ -146,11 +130,7 @@ def main():
         enable_thinking=args.enable_thinking,
         seed=args.seed,
     )
-    repair = RepairSettings(
-        comparison_method=args.comparison_method,
-        js_threshold=args.js_threshold,
-        max_steps=args.max_repair_steps,
-    )
+    repair = RepairSettings()
     generator = LeakageSafeGenerator(
         model=model,
         tokenizer=tokenizer,
