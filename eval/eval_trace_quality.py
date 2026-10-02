@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import os
 import re
+from pprint import pprint
 
 from datasets import load_dataset
 from openai import OpenAI
@@ -34,6 +35,10 @@ def parse_boxed_answer(text):
     if start == -1:
         return None
     start += len(marker)
+    # Special case: \boxed{} followed by }
+    # Interpreted as boxed answer = "}"
+    if start < len(text) - 1 and text[start] == "}" and text[start + 1] == "}":
+        return "}"
     depth = 1
     for i in range(start, len(text)):
         if text[i] == "{":
@@ -60,7 +65,8 @@ def get_ground_truth(example):
     parsed_answer = parse_boxed_answer(answer)
     if parsed_answer:
         answer = parsed_answer
-    return answer
+    return " " + answer.strip()
+    # return " " + f'\\boxed{{{answer}}}'
 
 
 def get_reasoning_content(example):
@@ -81,10 +87,13 @@ def get_question_messages(example, correctness_system=False):
 
     if correctness_system:
         system_prompt = (
-            r"You are a precise problem solver. Solve step by step, then give "
-            r"the final answer on its own line as \boxed{answer}, with only "
-            r"the result inside (no words/units), using exactly one \boxed{}."
+            r"You are a precise problem solver. Solve step by step, then give the final answer on its own line."
         )
+        # system_prompt = (
+        #     r"You are a precise problem solver. Solve step by step, then give "
+        #     r"the final answer on its own line as \boxed{answer}, with only "
+        #     r"the result inside (no words/units), using exactly one \boxed{}."
+        # )
         if messages[0]["role"] != "system":
             messages = [{"role": "system", "content": system_prompt}] + messages
         else:
@@ -124,57 +133,78 @@ def get_answer_scoring_prompt(messages, reasoning_content=None):
     if reasoning_content is None:
         # Question-only baseline for GALG.
         if prompt.rfind("<think>") != -1:
-            prompt += "</think>\nFinal answer: "
+            prompt += "</think>\nFinal answer:"
         else:
-            prompt += "Final answer: "
+            prompt += "Final answer:"
     else:
         # Question + rationale condition for GALG.
         if prompt.rfind("<think>") != -1:
-            prompt += reasoning_content + "\n</think>\nFinal answer: "
+            prompt += reasoning_content + "\n</think>\nFinal answer:"
         else:
-            prompt += "<think>\n" + reasoning_content + "\n</think>\nFinal answer: "
+            prompt += "<think>\n" + reasoning_content + "\n</think>\nFinal answer:"
 
     return replace_boxed(prompt)
 
 
-def get_completion_logps(client, prompt, completion):
+def get_completion_logps(client, prompt, completion, return_tokens=False):
     """
     Return log-probabilities only for `completion`.
 
-    max_tokens=1 is kept for OpenAI/vLLM compatibility with echo=True.
-    The final returned log-probability corresponds to that extra generated
-    token and is therefore removed.
+    Default behavior is unchanged. When return_tokens=True, also return
+    completion token strings aligned with the returned log-probabilities.
     """
     n_prompt_tokens = len(tokenizer.encode(prompt))
 
-    response = client.completions.create(
-        model=MODEL,
-        prompt=prompt + completion,
-        max_tokens=1,
-        logprobs=1,
-        echo=True
-    )
+    try:
+        response = client.completions.create(
+            model=MODEL,
+            prompt=prompt + completion,
+            max_tokens=1,
+            logprobs=1,
+            echo=True
+        )
 
-    logps = response.choices[0].logprobs.token_logprobs[n_prompt_tokens:]
+        choice_logprobs = response.choices[0].logprobs
+        logps = choice_logprobs.token_logprobs[n_prompt_tokens:]
+        tokens = choice_logprobs.tokens[n_prompt_tokens:]
 
-    # Remove the one newly generated token requested by max_tokens=1.
-    if len(logps) > 0:
-        logps = logps[:-1]
+        # Remove the one newly generated token requested by max_tokens=1.
+        if len(logps) > 0:
+            logps = logps[:-1]
+            tokens = tokens[:-1]
 
-    return [x for x in logps if x is not None]
+        pairs = [
+            (token, logp)
+            for token, logp in zip(tokens, logps)
+            if logp is not None
+        ]
 
+        if return_tokens:
+            return [logp for _, logp in pairs], [token for token, _ in pairs]
+
+        return [logp for _, logp in pairs]
+
+    except Exception as e:
+        print("Error:", e)
+        if return_tokens:
+            return [], []
+        return []
 
 def f_fluency(example):
     """Answer-Blind Rationale Perplexity (AB-PPL)."""
     client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
-    messages = get_question_messages(example)
+    try:
+        messages = get_question_messages(example)
+    except Exception as e:
+        return {"rendered_chat_fluency": "", "ab_ppl": None}
+        
     reasoning_content = get_reasoning_content(example)
     prompt = get_reasoning_scoring_prompt(messages)
 
     logps = get_completion_logps(client, prompt, reasoning_content)
     if len(logps) == 0:
-        return {"rendered_chat_fluency": "", "ab_ppl": -1.0}
+        return {"rendered_chat_fluency": "", "ab_ppl": None}
 
     logp = mean(logps)
     ppl = exp(-logp)
@@ -194,22 +224,34 @@ def f_pcs(example):
         return {
             "rendered_chat_pcs_blind": "",
             "rendered_chat_pcs_privileged": "",
-            "pcs": -1.0
+            "pcs": None,
+            "pcs_filtered_reasoning": None,
+            "pcs_removed_fraction": None,
         }
 
     reasoning_content = get_reasoning_content(example)
 
-    blind_messages = get_question_messages(example)
+    try:
+        blind_messages = get_question_messages(example)
+    except Exception as e:
+        return {
+            "rendered_chat_pcs_blind": "",
+            "rendered_chat_pcs_privileged": "",
+            "pcs": None,
+            "pcs_filtered_reasoning": None,
+            "pcs_removed_fraction": None,
+        }
+
     privileged_messages = add_privileged_context(blind_messages, answer)
 
     blind_prompt = get_reasoning_scoring_prompt(blind_messages)
     privileged_prompt = get_reasoning_scoring_prompt(privileged_messages)
 
-    blind_logps = get_completion_logps(
-        client, blind_prompt, reasoning_content
+    blind_logps, blind_tokens = get_completion_logps(
+        client, blind_prompt, reasoning_content, return_tokens=True
     )
-    privileged_logps = get_completion_logps(
-        client, privileged_prompt, reasoning_content
+    privileged_logps, _ = get_completion_logps(
+        client, privileged_prompt, reasoning_content, return_tokens=True
     )
 
     if (
@@ -220,31 +262,61 @@ def f_pcs(example):
         return {
             "rendered_chat_pcs_blind": blind_prompt + reasoning_content,
             "rendered_chat_pcs_privileged": privileged_prompt + reasoning_content,
-            "pcs": -1.0
+            "pcs": None,
+            "pcs_filtered_reasoning": None,
+            "pcs_removed_fraction": None,
         }
 
-    # Δ_t^priv = log p(r_t | q,c,r_<t) - log p(r_t | q,r_<t)
+    # Delta_t^priv = log p(r_t | q,c,r_<t) - log p(r_t | q,r_<t)
     deltas = [
         priv_lp - blind_lp
         for priv_lp, blind_lp in zip(privileged_logps, blind_logps)
     ]
 
-    # Only positive privileged-context effects count toward leakage sensitivity.
+    # PCS itself is unchanged.
     positive_deltas = [max(0.0, x) for x in deltas]
-
     k = max(1, int(len(positive_deltas) * PCS_TOP_RATIO + 0.999999))
     topk = sorted(positive_deltas, reverse=True)[:k]
     pcs = mean(topk)
 
+    # For LF-GALG, remove at most the same top-K fraction used by PCS,
+    # but only tokens with positive privileged-context influence.
+    positive_indices = [i for i, delta in enumerate(deltas) if delta > 0.0]
+    remove_indices = set(
+        sorted(
+            positive_indices,
+            key=lambda i: deltas[i],
+            reverse=True
+        )[:k]
+    )
+
+    filtered_reasoning = "".join(
+        token
+        for i, token in enumerate(blind_tokens)
+        if i not in remove_indices
+    )
+
+    removed_fraction = (
+        len(remove_indices) / len(deltas)
+        if len(deltas) > 0
+        else 0.0
+    )
+
     return {
         "rendered_chat_pcs_blind": blind_prompt + reasoning_content,
         "rendered_chat_pcs_privileged": privileged_prompt + reasoning_content,
-        "pcs": float(pcs)
+        "pcs": float(pcs),
+        "pcs_filtered_reasoning": filtered_reasoning,
+        "pcs_removed_fraction": float(removed_fraction),
     }
 
-
 def f_correctness_gain(example):
-    """Gold-Answer Log-Likelihood Gain (GALG)."""
+    """
+    Compute original GALG and leakage-filtered GALG (LF-GALG).
+
+    LF-GALG evaluates the gold-answer likelihood after removing the strongest
+    PCS-positive reasoning tokens identified by f_pcs.
+    """
     client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
     answer = get_ground_truth(example)
@@ -252,45 +324,75 @@ def f_correctness_gain(example):
         return {
             "rendered_chat_galg_base": "",
             "rendered_chat_galg_reason": "",
-            "galg": -999.0
+            "rendered_chat_lf_galg_reason": "",
+            "galg": None,
+            "lf_galg": None,
         }
 
     reasoning_content = get_reasoning_content(example)
-    messages = get_question_messages(example, correctness_system=True)
+    filtered_reasoning_content = example.get("pcs_filtered_reasoning", None)
 
-    # Score the answer content only; do not include \boxed{...} formatting.
+    try:
+        messages = get_question_messages(example, correctness_system=True)
+    except Exception as e:
+        return {
+            "rendered_chat_galg_base": "",
+            "rendered_chat_galg_reason": "",
+            "rendered_chat_lf_galg_reason": "",
+            "galg": None,
+            "lf_galg": None,
+        }
+
+    # Question-only baseline.
     base_prompt = get_answer_scoring_prompt(messages, reasoning_content=None)
+    base_logps = get_completion_logps(client, base_prompt, answer)
+
+    # Original GALG: unchanged.
     reason_prompt = get_answer_scoring_prompt(
         messages, reasoning_content=reasoning_content
     )
-
-    base_logps = get_completion_logps(client, base_prompt, answer)
     reason_logps = get_completion_logps(client, reason_prompt, answer)
 
+    galg = None
     if (
-        len(base_logps) == 0
-        or len(reason_logps) == 0
-        or len(base_logps) != len(reason_logps)
+        len(base_logps) > 0
+        and len(reason_logps) > 0
+        and len(base_logps) == len(reason_logps)
     ):
-        return {
-            "rendered_chat_galg_base": base_prompt + answer,
-            "rendered_chat_galg_reason": reason_prompt + answer,
-            "galg": -999.0
-        }
+        galg = mean(reason_logps) - mean(base_logps)
 
-    # Token-normalized gold-answer log-likelihood gain:
-    # GALG = mean log p(a* | q,r) - mean log p(a* | q)
-    galg = mean(reason_logps) - mean(base_logps)
+    # Leakage-filtered GALG.
+    lf_galg = None
+    filtered_reason_prompt = ""
+
+    if filtered_reasoning_content is not None and len(base_logps) > 0:
+        filtered_reason_prompt = get_answer_scoring_prompt(
+            messages, reasoning_content=filtered_reasoning_content
+        )
+        filtered_reason_logps = get_completion_logps(
+            client, filtered_reason_prompt, answer
+        )
+
+        if (
+            len(filtered_reason_logps) > 0
+            and len(base_logps) == len(filtered_reason_logps)
+        ):
+            lf_galg = mean(filtered_reason_logps) - mean(base_logps)
 
     return {
         "rendered_chat_galg_base": base_prompt + answer,
         "rendered_chat_galg_reason": reason_prompt + answer,
-        "galg": float(galg)
+        "rendered_chat_lf_galg_reason": (
+            filtered_reason_prompt + answer
+            if filtered_reason_prompt
+            else ""
+        ),
+        "galg": None if galg is None else float(galg),
+        "lf_galg": None if lf_galg is None else float(lf_galg),
     }
 
-
 def summarize_robust(values):
-    values = [x for x in values if x >= 0.0]
+    values = [x for x in values if x is not None]
     q25 = percentile(values, 25)
     q50 = median(values)
     q75 = percentile(values, 75)
@@ -326,33 +428,43 @@ def main():
 
     # 3) Whole-chain contribution to the gold answer: GALG
     ds = ds.map(f_correctness_gain, num_proc=NUM_PROC)
-    valid_galg = [x for x in ds["galg"] if x != -999.0]
+    valid_galg = [x for x in ds["galg"] if x is not None]
     galg_summary = summarize_robust(valid_galg)
     print("GALG mean:", galg_summary["mean"])
     print("GALG median:", galg_summary["median"])
+
+    valid_lf_galg = [x for x in ds["lf_galg"] if x is not None]
+    lf_galg_summary = summarize_robust(valid_lf_galg)
+    print("LF-GALG mean:", lf_galg_summary["mean"])
+    print("LF-GALG median:", lf_galg_summary["median"])
 
     if SAVE_PATH:
         results = {
             "ab_ppl": ab_ppl_summary,
             "pcs": pcs_summary,
             "galg": galg_summary,
+            "lf_galg": lf_galg_summary,
 
             # Per-example values are saved for later statistical analysis.
             "per_example": [
                 {
-                    "ab_ppl": float(ab_ppl),
-                    "pcs": float(pcs),
-                    "galg": float(galg),
+                    "ab_ppl": ab_ppl,
+                    "pcs": pcs,
+                    "galg": galg,
+                    "lf_galg": lf_galg,
                 }
-                for ab_ppl, pcs, galg in zip(
-                    ds["ab_ppl"], ds["pcs"], ds["galg"]
+                for ab_ppl, pcs, galg, lf_galg in zip(
+                    ds["ab_ppl"],
+                    ds["pcs"],
+                    ds["galg"],
+                    ds["lf_galg"],
                 )
             ],
 
             "rendered_chat_fluency": [
                 {
                     "text": text,
-                    "ab_ppl": float(ab_ppl),
+                    "ab_ppl": ab_ppl,
                 }
                 for text, ab_ppl in zip(
                     ds["rendered_chat_fluency"],
@@ -363,24 +475,32 @@ def main():
                 {
                     "blind": blind,
                     "privileged": privileged,
-                    "pcs": float(pcs),
+                    "pcs": pcs,
+                    "filtered_reasoning": filtered_reasoning,
+                    "removed_fraction": removed_fraction,
                 }
-                for blind, privileged, pcs in zip(
+                for blind, privileged, pcs, filtered_reasoning, removed_fraction in zip(
                     ds["rendered_chat_pcs_blind"],
                     ds["rendered_chat_pcs_privileged"],
-                    ds["pcs"]
+                    ds["pcs"],
+                    ds["pcs_filtered_reasoning"],
+                    ds["pcs_removed_fraction"],
                 )
             ],
             "rendered_chat_galg": [
                 {
                     "base": base,
                     "reason": reason,
-                    "galg": float(galg),
+                    "filtered_reason": filtered_reason,
+                    "galg": galg,
+                    "lf_galg": lf_galg,
                 }
-                for base, reason, galg in zip(
+                for base, reason, filtered_reason, galg, lf_galg in zip(
                     ds["rendered_chat_galg_base"],
                     ds["rendered_chat_galg_reason"],
-                    ds["galg"]
+                    ds["rendered_chat_lf_galg_reason"],
+                    ds["galg"],
+                    ds["lf_galg"],
                 )
             ],
         }
@@ -402,7 +522,7 @@ if __name__ == "__main__":
         "traffic-hope-network-train/data_new/all_methods"
     )
 
-    # METHODS = ["ours"]
+    METHODS = ["leakage"]
     # MODELS = [
     #     "Nemo3-Nano-4B",
     #     "Qwen3-4B",
@@ -413,9 +533,21 @@ if __name__ == "__main__":
     # PORTS = ["8000", "8001", "8002", "8003", "8004"]
     # DOMAINS = ["logic"]
 
-    METHODS = ["ours_clean"]
-    MODELS = ["Qwen3-4B"]
-    PORTS = ["8001"]
+    # METHODS = ["aug_sup", "leakage", "ours_clean", "rephrase", "ssr_d"]
+    MODELS = [
+        "Nemo3-Nano-4B",
+        # "Qwen3-4B",
+        # "Qwen3-8B",
+        # "Qwen3-14B",
+        # "DeepSeek-R1-Distill-Qwen-14B"
+    ]
+    PORTS = [
+        "8000", 
+        # "8001", 
+        # "8002", 
+        # "8003", 
+        # "8004"
+    ]
     DOMAINS = ["logic", "Math", "multihop-reasoning", "science"]
 
     MODEL = None
