@@ -230,6 +230,60 @@ def _style_leakage_ticklabels(labels, tick_is_leakage, leakage_label_color):
             label.set_color(leakage_label_color)
             label.set_fontweight("bold")
 
+
+def _annotate_vertical_token_labels(
+    ax,
+    tick_positions,
+    tick_labels,
+    tick_is_leakage,
+    label_fontsize,
+    leakage_label_color,
+    rows=4,
+):
+    from matplotlib.transforms import blended_transform_factory
+
+    transform = blended_transform_factory(ax.transData, ax.transAxes)
+    rows = max(1, rows)
+
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels([])
+    ax.tick_params(axis="x", length=0, pad=1)
+
+    for i, (pos, label, is_leakage) in enumerate(zip(tick_positions, tick_labels, tick_is_leakage)):
+        row = i % rows
+        y = -0.08 - row * 0.075
+        x_shift = (row - (rows - 1) / 2) * 0.18
+        color = leakage_label_color if is_leakage else ("0.45" if label == "..." else "black")
+        bbox = (
+            dict(facecolor="white", edgecolor=leakage_label_color, linewidth=0.7, alpha=0.85, pad=1.5)
+            if is_leakage
+            else None
+        )
+        ax.text(
+            pos + x_shift,
+            y,
+            label,
+            transform=transform,
+            ha="center",
+            va="top",
+            rotation=0,
+            fontsize=label_fontsize,
+            color=color,
+            fontweight="bold" if is_leakage else "normal",
+            bbox=bbox,
+            clip_on=False,
+        )
+        if is_leakage:
+            ax.plot(
+                [pos, pos + x_shift],
+                [-0.01, y + 0.015],
+                transform=transform,
+                color=leakage_label_color,
+                linewidth=0.6,
+                alpha=0.65,
+                clip_on=False,
+            )
+
 def _set_token_axis_labels(ax, tokenizer, sequence_ids, x_indices, y_indices, label_fontsize):
     x_ticks, x_labels = _token_ticks_and_labels(tokenizer, sequence_ids, x_indices)
     y_ticks, y_labels = _token_ticks_and_labels(tokenizer, sequence_ids, y_indices)
@@ -456,17 +510,27 @@ def plot_selective_attention_bar(
             if orientation == "vertical":
                 ax.bar(positions, values, color=bar_colors)
                 if show_token_labels:
-                    ax.set_xticks(x_ticks)
-                    ax.set_xticklabels(
-                        x_labels,
-                        rotation=270,
-                        fontsize=label_fontsize,
-                        ha="left",
-                        va="center",
-                        rotation_mode="anchor",
-                    )
-                    _style_leakage_ticklabels(ax.get_xticklabels(), tick_is_leakage, leakage_label_color)
-                    ax.tick_params(axis="x", length=0, pad=2)
+                    if compact_labels:
+                        _annotate_vertical_token_labels(
+                            ax,
+                            x_ticks,
+                            x_labels,
+                            tick_is_leakage,
+                            label_fontsize,
+                            leakage_label_color,
+                        )
+                    else:
+                        ax.set_xticks(x_ticks)
+                        ax.set_xticklabels(
+                            x_labels,
+                            rotation=45,
+                            fontsize=label_fontsize,
+                            ha="right",
+                            va="top",
+                            rotation_mode="anchor",
+                        )
+                        _style_leakage_ticklabels(ax.get_xticklabels(), tick_is_leakage, leakage_label_color)
+                        ax.tick_params(axis="x", length=0, pad=2)
                     ax.set_xlim(min(x_ticks) - 0.5, max(x_ticks) + 0.5)
                 else:
                     ax.set_xticks([])
@@ -489,6 +553,8 @@ def plot_selective_attention_bar(
     fig.suptitle("Selective attention mass to leveraging-context cluster", y=1.0)
     if tight:
         fig.tight_layout(pad=0.3)
+        if orientation == "vertical" and show_token_labels and compact_labels:
+            fig.subplots_adjust(bottom=max(fig.subplotpars.bottom, 0.28))
     else:
         fig.subplots_adjust(left=0.02, right=0.995, bottom=0.02, top=0.99, wspace=0.15, hspace=0.15)
 
