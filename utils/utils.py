@@ -90,16 +90,17 @@ def get_attention_weights(
     attentions = tuple(attn.detach().float().cpu() for attn in outputs.attentions)
     return attentions, outputs
 
+def _token_text(tokenizer, sequence_ids, idx, max_chars=10):
+    text = tokenizer.decode([int(sequence_ids[idx])], skip_special_tokens=False)
+    text = text.replace("\n", "\\n").replace("\t", "\\t").replace(" ", "_")
+    text = text.replace("$", r"\$")
+    if len(text) > max_chars:
+        text = text[:max_chars] + "..."
+    return f"{idx}:{text}"
+
+
 def _token_labels(tokenizer, sequence_ids, indices, max_chars=10):
-    labels = []
-    for idx in indices:
-        text = tokenizer.decode([int(sequence_ids[idx])], skip_special_tokens=False)
-        text = text.replace("\n", "\\n").replace("\t", "\\t").replace(" ", "_")
-        text = text.replace("$", r"\$")
-        if len(text) > max_chars:
-            text = text[:max_chars] + "..."
-        labels.append(f"{idx}:{text}")
-    return labels
+    return [_token_text(tokenizer, sequence_ids, idx, max_chars) for idx in indices]
 
 def _token_ticks_and_labels(tokenizer, sequence_ids, indices, max_chars=10):
     tick_positions = []
@@ -117,6 +118,117 @@ def _token_ticks_and_labels(tokenizer, sequence_ids, indices, max_chars=10):
         tick_labels.append("...")
 
     return tick_positions, tick_labels
+
+
+def _find_all(text, needle):
+    start = 0
+    while needle:
+        idx = text.find(needle, start)
+        if idx < 0:
+            break
+        yield idx
+        start = idx + len(needle)
+
+
+def _overlapping_token_positions(offsets, start_char, end_char):
+    return [
+        idx
+        for idx, (start, end) in enumerate(offsets)
+        if end > start_char and start < end_char
+    ]
+
+
+def _leakage_output_indices(
+    tokenizer,
+    leakage_spans=None,
+    prompt_len=None,
+    full_text=None,
+    response_text=None,
+):
+    if leakage_spans is None:
+        return set()
+    if isinstance(leakage_spans, str):
+        leakage_spans = [leakage_spans]
+
+    if full_text is not None:
+        if prompt_len is None:
+            raise ValueError("prompt_len is required when full_text is used.")
+        encoded = tokenizer(full_text, return_offsets_mapping=True)
+        offsets = encoded["offset_mapping"]
+        output_indices = set()
+        for span in leakage_spans:
+            for start_char in _find_all(full_text, span):
+                for token_idx in _overlapping_token_positions(offsets, start_char, start_char + len(span)):
+                    if token_idx >= prompt_len:
+                        output_indices.add(token_idx - prompt_len)
+        return output_indices
+
+    if response_text is not None:
+        encoded = tokenizer(response_text, return_offsets_mapping=True, add_special_tokens=False)
+        offsets = encoded["offset_mapping"]
+        output_indices = set()
+        for span in leakage_spans:
+            for start_char in _find_all(response_text, span):
+                output_indices.update(
+                    _overlapping_token_positions(offsets, start_char, start_char + len(span))
+                )
+        return output_indices
+
+    return set()
+
+
+def _compact_token_ticks_and_labels(
+    tokenizer,
+    sequence_ids,
+    label_indices,
+    leakage_positions,
+    context_tokens=8,
+    edge_tokens=2,
+    max_chars=10,
+    leakage_max_chars=40,
+):
+    total = len(label_indices)
+    leakage_positions = {pos for pos in leakage_positions if 0 <= pos < total}
+
+    if leakage_positions:
+        selected = set(range(min(edge_tokens, total)))
+        selected.update(range(max(0, total - edge_tokens), total))
+        for pos in leakage_positions:
+            selected.update(range(max(0, pos - context_tokens), min(total, pos + context_tokens + 1)))
+    else:
+        max_labels = 80
+        step = max(1, total // max_labels)
+        selected = set(range(0, total, step))
+        selected.update(range(max(0, total - edge_tokens), total))
+
+    tick_positions, tick_labels, tick_is_leakage = [], [], []
+    previous = -1
+    for pos in sorted(selected):
+        if pos > previous + 1:
+            tick_positions.append((previous + 1 + pos - 1) / 2)
+            tick_labels.append("...")
+            tick_is_leakage.append(False)
+
+        max_len = leakage_max_chars if pos in leakage_positions else max_chars
+        tick_positions.append(pos)
+        tick_labels.append(_token_text(tokenizer, sequence_ids, label_indices[pos], max_len))
+        tick_is_leakage.append(pos in leakage_positions)
+        previous = pos
+
+    if previous < total - 1:
+        tick_positions.append((previous + 1 + total - 1) / 2)
+        tick_labels.append("...")
+        tick_is_leakage.append(False)
+
+    return tick_positions, tick_labels, tick_is_leakage
+
+
+def _style_leakage_ticklabels(labels, tick_is_leakage, leakage_label_color):
+    for label, is_leakage in zip(labels, tick_is_leakage):
+        label.set_clip_on(False)
+        if is_leakage:
+            label.set_color(leakage_label_color)
+            label.set_fontweight("bold")
 
 def _set_token_axis_labels(ax, tokenizer, sequence_ids, x_indices, y_indices, label_fontsize):
     x_ticks, x_labels = _token_ticks_and_labels(tokenizer, sequence_ids, x_indices)
@@ -244,11 +356,20 @@ def plot_selective_attention_bar(
     prompt_len=None,
     tokenizer=None,
     sequence_ids=None,
+    leakage_spans=None,
+    full_text=None,
+    response_text=None,
     out_path=None,
     color="tab:blue",
+    leakage_color="tab:red",
+    leakage_label_color="crimson",
     dpi=180,
     figsize=(18, 14),
     label_fontsize=6,
+    compact_labels=False,
+    label_context_tokens=8,
+    edge_label_tokens=2,
+    leakage_label_max_chars=40,
     orientation="vertical",
     tight=True,
 ):
@@ -280,7 +401,33 @@ def plot_selective_attention_bar(
         sequence_ids = sequence_ids.detach().cpu()
         if sequence_ids.dim() > 1:
             sequence_ids = sequence_ids[0]
-        x_ticks, x_labels = _token_ticks_and_labels(tokenizer, sequence_ids, label_indices)
+        leakage_output_indices = _leakage_output_indices(
+            tokenizer,
+            leakage_spans=leakage_spans,
+            prompt_len=prompt_len,
+            full_text=full_text,
+            response_text=response_text,
+        )
+        leakage_positions = {
+            idx - start_y
+            for idx in leakage_output_indices
+            if start_y <= idx < end_y
+        }
+        if compact_labels:
+            x_ticks, x_labels, tick_is_leakage = _compact_token_ticks_and_labels(
+                tokenizer,
+                sequence_ids,
+                label_indices,
+                leakage_positions,
+                context_tokens=label_context_tokens,
+                edge_tokens=edge_label_tokens,
+                leakage_max_chars=leakage_label_max_chars,
+            )
+        else:
+            x_ticks, x_labels = _token_ticks_and_labels(tokenizer, sequence_ids, label_indices)
+            tick_is_leakage = [False] * len(x_labels)
+    else:
+        leakage_positions = set()
 
     fig, axes = plt.subplots(
         len(selected_layers),
@@ -301,21 +448,34 @@ def plot_selective_attention_bar(
 
             positions = range(len(y_indices))
             values = values.detach().cpu().numpy()
+            bar_colors = [
+                leakage_color if pos in leakage_positions else color
+                for pos in range(len(y_indices))
+            ]
 
             if orientation == "vertical":
-                ax.bar(positions, values, color=color)
+                ax.bar(positions, values, color=bar_colors)
                 if show_token_labels:
                     ax.set_xticks(x_ticks)
-                    ax.set_xticklabels(x_labels, rotation=90, fontsize=label_fontsize)
-                    ax.tick_params(axis="x", length=0, pad=1)
+                    ax.set_xticklabels(
+                        x_labels,
+                        rotation=270,
+                        fontsize=label_fontsize,
+                        ha="left",
+                        va="center",
+                        rotation_mode="anchor",
+                    )
+                    _style_leakage_ticklabels(ax.get_xticklabels(), tick_is_leakage, leakage_label_color)
+                    ax.tick_params(axis="x", length=0, pad=2)
                     ax.set_xlim(min(x_ticks) - 0.5, max(x_ticks) + 0.5)
                 else:
                     ax.set_xticks([])
             else:
-                ax.barh(positions, values, color=color)
+                ax.barh(positions, values, color=bar_colors)
                 if show_token_labels:
                     ax.set_yticks(x_ticks)
                     ax.set_yticklabels(x_labels, fontsize=label_fontsize)
+                    _style_leakage_ticklabels(ax.get_yticklabels(), tick_is_leakage, leakage_label_color)
                     ax.tick_params(axis="y", length=0, pad=1)
                     ax.set_ylim(max(x_ticks) + 0.5, min(x_ticks) - 0.5)
                 else:
