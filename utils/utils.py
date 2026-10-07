@@ -238,21 +238,17 @@ def _annotate_vertical_token_labels(
     tick_is_leakage,
     label_fontsize,
     leakage_label_color,
-    rows=4,
 ):
     from matplotlib.transforms import blended_transform_factory
 
     transform = blended_transform_factory(ax.transData, ax.transAxes)
-    rows = max(1, rows)
 
     ax.set_xticks(tick_positions)
     ax.set_xticklabels([])
     ax.tick_params(axis="x", length=0, pad=1)
 
     for i, (pos, label, is_leakage) in enumerate(zip(tick_positions, tick_labels, tick_is_leakage)):
-        row = i % rows
-        y = -0.08 - row * 0.075
-        x_shift = (row - (rows - 1) / 2) * 0.18
+        y = -0.10
         color = leakage_label_color if is_leakage else ("0.45" if label == "..." else "black")
         bbox = (
             dict(facecolor="white", edgecolor=leakage_label_color, linewidth=0.7, alpha=0.85, pad=1.5)
@@ -260,7 +256,7 @@ def _annotate_vertical_token_labels(
             else None
         )
         ax.text(
-            pos + x_shift,
+            pos,
             y,
             label,
             transform=transform,
@@ -275,7 +271,7 @@ def _annotate_vertical_token_labels(
         )
         if is_leakage:
             ax.plot(
-                [pos, pos + x_shift],
+                [pos, pos],
                 [-0.01, y + 0.015],
                 transform=transform,
                 color=leakage_label_color,
