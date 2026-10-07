@@ -247,6 +247,7 @@ def _annotate_vertical_token_labels(
     ax.set_xticklabels([])
     ax.tick_params(axis="x", length=0, pad=1)
 
+    texts = []
     for i, (pos, label, is_leakage) in enumerate(zip(tick_positions, tick_labels, tick_is_leakage)):
         y = -0.10
         color = leakage_label_color if is_leakage else ("0.45" if label == "..." else "black")
@@ -255,7 +256,7 @@ def _annotate_vertical_token_labels(
             if is_leakage
             else None
         )
-        ax.text(
+        text = ax.text(
             pos,
             y,
             label,
@@ -269,6 +270,7 @@ def _annotate_vertical_token_labels(
             bbox=bbox,
             clip_on=False,
         )
+        texts.append(text)
         if is_leakage:
             ax.plot(
                 [pos, pos],
@@ -279,6 +281,43 @@ def _annotate_vertical_token_labels(
                 alpha=0.65,
                 clip_on=False,
             )
+    _spread_horizontal_annotations(ax, texts, tick_positions, tick_is_leakage, y=-0.10)
+
+
+def _spread_horizontal_annotations(ax, texts, anchor_positions, tick_is_leakage, y=-0.10, gap_px=8):
+    if not texts:
+        return
+
+    fig = ax.figure
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    transform = texts[0].get_transform()
+
+    anchors_px = [transform.transform((float(pos), y))[0] for pos in anchor_positions]
+    widths = [text.get_window_extent(renderer=renderer).width for text in texts]
+    order = sorted(range(len(texts)), key=lambda i: anchors_px[i])
+
+    centers = [None] * len(texts)
+    previous_center = None
+    previous_width = None
+    for idx in order:
+        center = anchors_px[idx]
+        if previous_center is not None:
+            min_center = previous_center + (previous_width + widths[idx]) / 2 + gap_px
+            center = max(center, min_center)
+        centers[idx] = center
+        previous_center = center
+        previous_width = widths[idx]
+
+    leakage_indices = [i for i, is_leakage in enumerate(tick_is_leakage) if is_leakage]
+    align_indices = leakage_indices or list(range(len(texts)))
+    shift = sum(anchors_px[i] - centers[i] for i in align_indices) / len(align_indices)
+    centers = [center + shift for center in centers]
+
+    y_px = transform.transform((0, y))[1]
+    inverse = transform.inverted()
+    for text, center in zip(texts, centers):
+        text.set_x(float(inverse.transform((center, y_px))[0]))
 
 def _set_token_axis_labels(ax, tokenizer, sequence_ids, x_indices, y_indices, label_fontsize):
     x_ticks, x_labels = _token_ticks_and_labels(tokenizer, sequence_ids, x_indices)
@@ -506,6 +545,7 @@ def plot_selective_attention_bar(
             if orientation == "vertical":
                 ax.bar(positions, values, color=bar_colors)
                 if show_token_labels:
+                    ax.set_xlim(min(x_ticks) - 0.5, max(x_ticks) + 0.5)
                     if compact_labels:
                         _annotate_vertical_token_labels(
                             ax,
@@ -527,7 +567,6 @@ def plot_selective_attention_bar(
                         )
                         _style_leakage_ticklabels(ax.get_xticklabels(), tick_is_leakage, leakage_label_color)
                         ax.tick_params(axis="x", length=0, pad=2)
-                    ax.set_xlim(min(x_ticks) - 0.5, max(x_ticks) + 0.5)
                 else:
                     ax.set_xticks([])
             else:
