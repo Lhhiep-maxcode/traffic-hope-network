@@ -20,7 +20,7 @@ from utils.utils import build_prompt, load_model_and_tokenizer, read_json, read_
 
 EPS = 1e-12
 PRIVILEGED_MARKER = "Given the ground truth answer is "
-SCORE_METHOD = "leakage_cosine_or_non_leak_top5_penalty"
+SCORE_METHOD = "leakage_cosine_or_non_leak_cv_penalty"
 
 
 def parse_args():
@@ -216,17 +216,18 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a * b).sum(dim=-1) / (a.norm(dim=-1) * b.norm()).clamp_min(EPS)
 
 
-def topk_mean(values: torch.Tensor, k: int = 5) -> torch.Tensor:
+def coefficient_variation(values: torch.Tensor) -> torch.Tensor:
     if values.shape[-1] == 0:
         return torch.zeros(values.shape[:-1], dtype=values.dtype, device=values.device)
-    k = min(k, values.shape[-1])
-    return values.topk(k, dim=-1).values.mean(dim=-1)
+    mean = values.mean(dim=-1)
+    std = values.std(dim=-1, unbiased=False)
+    return std / mean.clamp_min(EPS)
 
 
 def leakage_shape_score(real: torch.Tensor, ideal: torch.Tensor) -> torch.Tensor:
     if bool(ideal.bool().any()):
         return cosine(real, ideal)
-    return -topk_mean(real)
+    return -coefficient_variation(real)
 
 
 def head_scores(attentions, sample: dict) -> torch.Tensor:
@@ -290,7 +291,7 @@ def shape_metrics(records: list[dict], args) -> list[dict]:
                 score = float(cosine(real, record["ideal"]))
                 leakage_scores.append(score)
             else:
-                penalty = float(topk_mean(real))
+                penalty = float(coefficient_variation(real))
                 score = -penalty
                 non_leak_penalties.append(penalty)
             scores.append(score)
@@ -305,7 +306,7 @@ def shape_metrics(records: list[dict], args) -> list[dict]:
             "mean_leakage_cosine": (
                 float(torch.tensor(leakage_scores).mean()) if leakage_scores else None
             ),
-            "mean_non_leak_top5": (
+            "mean_non_leak_cv": (
                 float(torch.tensor(non_leak_penalties).mean()) if non_leak_penalties else None
             ),
             "samples": len(records),
@@ -397,36 +398,11 @@ def load_head_scores(model, tokenizer, samples: list[dict], args) -> torch.Tenso
         print(f"Loaded head scores from {args.score_cache_path}.")
         return cache["scores"]
 
-    if int(cache.get("used", -1)) != len(samples):
-        raise ValueError(
-            "Old head-score cache cannot be upgraded because cache['used'] "
-            f"={cache.get('used')} but current usable samples={len(samples)}. "
-            "Run without --from-cache to recompute from scratch."
-        )
-
-    print("Legacy: Upgrading old head-score cache to new score method.")
-    empty_samples = [sample for sample in samples if not sample["ideal"].bool().any()]
-    if empty_samples:
-        empty_total, empty_used = head_score_sum(
-            model,
-            tokenizer,
-            empty_samples,
-            args,
-            desc="Scoring empty-leakage samples",
-        )
-        scores = cache["scores"].float() + empty_total / len(samples)
-    else:
-        empty_used = 0
-
-    torch.save({
-        "model": model_name_key(args),
-        "score_method": SCORE_METHOD,
-        "scores": scores.cpu(),
-        "used": len(samples),
-    }, args.score_cache_path)
-    print(f"Loaded head scores from {args.score_cache_path}.")
-    print(f"Upgraded old cache with {empty_used} empty-leakage samples.")
-    return scores
+    raise ValueError(
+        f"Cached score_method={cache.get('score_method')!r} is incompatible with "
+        f"current score_method={SCORE_METHOD!r}. Run without --from-cache to "
+        "recompute head scores from scratch."
+    )
 
 
 def detector_records_by_k(model, tokenizer, samples: list[dict], scores: torch.Tensor, args):
@@ -498,7 +474,7 @@ def calibrate(model, tokenizer, args):
     # records_by_k = {k: [{"real": tensor, "ideal": tensor}, ...], ...}
     # top_ks = [1, 2, 4, 8, 16] or user-specified
 
-    # compute leakage cosine or non-leakage top-5-mean penalty for all top-k/window configs
+    # compute leakage cosine or non-leakage CV penalty for all top-k/window configs
     all_metrics = []
     for k in top_ks:
         rows = [{**row, "model": key, "top_k": k} for row in shape_metrics(records_by_k[k], args)]
