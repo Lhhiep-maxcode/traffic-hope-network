@@ -48,22 +48,21 @@ def parse_args():
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--dtype", default="float16", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--disable-thinking", action="store_true")
-    parser.add_argument(
-        "--nonleak-penalty",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use CV penalty for non-leakage samples. Disable with --no-nonleak-penalty.",
-    )
+    parser.add_argument("--disable-nonleak-penalty", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--from-cache", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
+def use_nonleak_penalty(args) -> bool:
+    return not args.disable_nonleak_penalty
+
+
 def score_method(args) -> str:
     return (
         SCORE_METHOD_WITH_NONLEAK_PENALTY
-        if args.nonleak_penalty
+        if use_nonleak_penalty(args)
         else SCORE_METHOD_COSINE_ONLY
     )
 
@@ -247,7 +246,7 @@ def leakage_shape_score(real: torch.Tensor, ideal: torch.Tensor, nonleak_penalty
 
 def head_scores(attentions, sample: dict, args) -> torch.Tensor:
     raw = attention_to_context(attentions, sample["prompt_len"], sample["key_tokens"])
-    return leakage_shape_score(raw, sample["ideal"], args.nonleak_penalty)  # shape = (num_layers, num_heads)
+    return leakage_shape_score(raw, sample["ideal"], use_nonleak_penalty(args))  # shape = (num_layers, num_heads)
 
 
 def top_heads(scores: torch.Tensor, top_k: int) -> list[dict]:
@@ -298,6 +297,7 @@ def token_spans(mask: torch.Tensor) -> list[dict]:
 
 def shape_metrics(records: list[dict], args) -> list[dict]:
     rows = []
+    nonleak_penalty = use_nonleak_penalty(args)
     for window_size in int_grid(args.window_sizes):
         scores, leakage_scores, non_leak_penalties = [], [], []
         for record in records:
@@ -306,7 +306,7 @@ def shape_metrics(records: list[dict], args) -> list[dict]:
                 score = float(cosine(real, record["ideal"]))
                 leakage_scores.append(score)
             else:
-                if args.nonleak_penalty:
+                if nonleak_penalty:
                     penalty = float(coefficient_variation(real))
                     score = -penalty
                     non_leak_penalties.append(penalty)
@@ -316,7 +316,7 @@ def shape_metrics(records: list[dict], args) -> list[dict]:
         score_tensor = torch.tensor(scores)
         rows.append({
             "window_size": window_size,
-            "nonleak_penalty": args.nonleak_penalty,
+            "nonleak_penalty": nonleak_penalty,
             "mean_score": float(score_tensor.mean()),
             "median_score": float(score_tensor.median()),
             "min_score": float(score_tensor.min()),
@@ -455,7 +455,7 @@ def save_detector_config(heads: list[dict], best: dict, args):
         "top_k_values": best["top_k_values"],
         "heads": heads,
         "aggregation": args.aggregation,
-        "nonleak_penalty": args.nonleak_penalty,
+        "nonleak_penalty": use_nonleak_penalty(args),
         "score_method": score_method(args),
         "window_size": best["window_size"],
         "threshold": None,
