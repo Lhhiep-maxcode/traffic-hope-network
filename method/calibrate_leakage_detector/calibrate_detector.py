@@ -20,7 +20,8 @@ from utils.utils import build_prompt, load_model_and_tokenizer, read_json, read_
 
 EPS = 1e-12
 PRIVILEGED_MARKER = "Given the ground truth answer is "
-SCORE_METHOD = "leakage_cosine_or_non_leak_cv_penalty"
+SCORE_METHOD_WITH_NONLEAK_PENALTY = "leakage_cosine_or_non_leak_cv_penalty"
+SCORE_METHOD_COSINE_ONLY = "cosine_for_all_samples"
 
 
 def parse_args():
@@ -47,10 +48,24 @@ def parse_args():
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--dtype", default="float16", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--disable-thinking", action="store_true")
+    parser.add_argument(
+        "--nonleak-penalty",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use CV penalty for non-leakage samples. Disable with --no-nonleak-penalty.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--from-cache", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def score_method(args) -> str:
+    return (
+        SCORE_METHOD_WITH_NONLEAK_PENALTY
+        if args.nonleak_penalty
+        else SCORE_METHOD_COSINE_ONLY
+    )
 
 
 def model_name_key(args) -> str:
@@ -224,15 +239,15 @@ def coefficient_variation(values: torch.Tensor) -> torch.Tensor:
     return std / mean.clamp_min(EPS)
 
 
-def leakage_shape_score(real: torch.Tensor, ideal: torch.Tensor) -> torch.Tensor:
-    if bool(ideal.bool().any()):
+def leakage_shape_score(real: torch.Tensor, ideal: torch.Tensor, nonleak_penalty: bool = True) -> torch.Tensor:
+    if bool(ideal.bool().any()) or not nonleak_penalty:
         return cosine(real, ideal)
     return -coefficient_variation(real)
 
 
-def head_scores(attentions, sample: dict) -> torch.Tensor:
+def head_scores(attentions, sample: dict, args) -> torch.Tensor:
     raw = attention_to_context(attentions, sample["prompt_len"], sample["key_tokens"])
-    return leakage_shape_score(raw, sample["ideal"])  # shape = (num_layers, num_heads)
+    return leakage_shape_score(raw, sample["ideal"], args.nonleak_penalty)  # shape = (num_layers, num_heads)
 
 
 def top_heads(scores: torch.Tensor, top_k: int) -> list[dict]:
@@ -291,13 +306,17 @@ def shape_metrics(records: list[dict], args) -> list[dict]:
                 score = float(cosine(real, record["ideal"]))
                 leakage_scores.append(score)
             else:
-                penalty = float(coefficient_variation(real))
-                score = -penalty
-                non_leak_penalties.append(penalty)
+                if args.nonleak_penalty:
+                    penalty = float(coefficient_variation(real))
+                    score = -penalty
+                    non_leak_penalties.append(penalty)
+                else:
+                    score = float(cosine(real, record["ideal"]))
             scores.append(score)
         score_tensor = torch.tensor(scores)
         rows.append({
             "window_size": window_size,
+            "nonleak_penalty": args.nonleak_penalty,
             "mean_score": float(score_tensor.mean()),
             "median_score": float(score_tensor.median()),
             "min_score": float(score_tensor.min()),
@@ -355,7 +374,7 @@ def calibrate_head_scores(model, tokenizer, samples: list[dict], args) -> torch.
         batch_attn = get_batch_attention_weights(model, tokenizer, batch)
         for batch_idx, sample in enumerate(batch):
             sample_attn = take_sample_attentions(batch_attn, batch_idx, len(sample["input_ids"]))
-            scores = head_scores(sample_attn, sample)
+            scores = head_scores(sample_attn, sample, args)
             total = scores if total is None else total + scores
             used += 1
         del batch_attn
@@ -364,7 +383,7 @@ def calibrate_head_scores(model, tokenizer, samples: list[dict], args) -> torch.
     scores = total / used
     torch.save({
         "model": model_name_key(args),
-        "score_method": SCORE_METHOD,
+        "score_method": score_method(args),
         "scores": scores.cpu(),
         "used": used,
     }, args.score_cache_path)
@@ -377,7 +396,7 @@ def head_score_sum(model, tokenizer, samples: list[dict], args, desc: str) -> tu
         batch_attn = get_batch_attention_weights(model, tokenizer, batch)
         for batch_idx, sample in enumerate(batch):
             sample_attn = take_sample_attentions(batch_attn, batch_idx, len(sample["input_ids"]))
-            scores = head_scores(sample_attn, sample)
+            scores = head_scores(sample_attn, sample, args)
             total = scores if total is None else total + scores
             used += 1
         del batch_attn
@@ -394,13 +413,14 @@ def load_head_scores(model, tokenizer, samples: list[dict], args) -> torch.Tenso
             f"Cache is for {cache.get('model')}, but --model is {model_name_key(args)}.",
             UserWarning,
         )
-    if cache.get("score_method") == SCORE_METHOD:
+    current_method = score_method(args)
+    if cache.get("score_method") == current_method:
         print(f"Loaded head scores from {args.score_cache_path}.")
         return cache["scores"]
 
     raise ValueError(
         f"Cached score_method={cache.get('score_method')!r} is incompatible with "
-        f"current score_method={SCORE_METHOD!r}. Run without --from-cache to "
+        f"current score_method={current_method!r}. Run without --from-cache to "
         "recompute head scores from scratch."
     )
 
@@ -435,6 +455,8 @@ def save_detector_config(heads: list[dict], best: dict, args):
         "top_k_values": best["top_k_values"],
         "heads": heads,
         "aggregation": args.aggregation,
+        "nonleak_penalty": args.nonleak_penalty,
+        "score_method": score_method(args),
         "window_size": best["window_size"],
         "threshold": None,
         "val_calibration_mean_score": best["mean_score"],
